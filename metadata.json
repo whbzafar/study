@@ -1,0 +1,6 @@
+{
+  "name": "ExamPilot Pakistan",
+  "description": "AI-Powered Past Paper, MCQ Practice & Competitive Exam Preparation Platform for PPSC, FPSC, SPSC, KPPSC, BPSC, and NTS tests.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
