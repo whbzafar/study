@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useRef, useMemo } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { useApp } from '../context/AppContext';
 import {
   UploadCloud,
@@ -19,7 +19,6 @@ import {
   RotateCcw,
   Layers,
   FileCheck,
-  FileSearch,
   Eye,
   Trash2,
   Save,
@@ -27,16 +26,47 @@ import {
   Trophy,
   XCircle,
   BarChart3,
-  Filter,
-  Check,
   BookOpen,
   Bookmark,
+  Link,
+  Video,
+  RefreshCw,
+  HardDrive,
+  Check,
+  ListPlus,
+  Send,
+  Zap,
+  Search,
+  Tag,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
-import { Question, ExaminingBodyId } from '../types';
+import { Question, ExaminingBodyId, ProcessingJob, SystemLimitsResponse, DocumentOutline, DocumentChapter } from '../types';
 import { InteractiveMcqCard } from './InteractiveMcqCard';
+import { VideoTranscriptModal } from './VideoTranscriptModal';
+import {
+  uploadFileInChunks,
+  importFromPublicUrl,
+  fetchSystemLimits,
+  retryJob,
+  cancelJob,
+  fetchDocumentOutline,
+  generateChapterQuestions,
+  UploadProgressEvent,
+} from '../utils/chunkedUploader';
 import scannerDiagramImg from '../assets/images/pdf_scanner_diagram_1792592295901.jpg';
 
-type ConverterStage = 'upload' | 'processing' | 'review' | 'quiz' | 'results';
+type ConverterStage = 'upload' | 'outline' | 'processing' | 'review' | 'quiz' | 'results';
+type IngestionMode = 'upload_files' | 'import_url' | 'presets' | 'queue';
+
+interface QueuedUploadItem {
+  id: string;
+  file: File;
+  progress?: UploadProgressEvent;
+  status: 'pending' | 'uploading' | 'completed' | 'failed' | 'paused';
+  errorMessage?: string;
+  jobId?: string;
+}
 
 export const PdfConverterView: React.FC = () => {
   const {
@@ -47,192 +77,470 @@ export const PdfConverterView: React.FC = () => {
     bookmarks,
     startPracticeSession,
     setActiveTab,
+    processingJobs,
+    refreshJobsFromServer,
+    publishJobQuestionsToPaper,
   } = useApp();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Workflow stage
   const [currentStage, setCurrentStage] = useState<ConverterStage>('upload');
+  const [ingestionMode, setIngestionMode] = useState<IngestionMode>('upload_files');
 
-  // Conversion Mode: Past Paper extraction vs. Notes/Textbook MCQ generation
+  // Deployment limits
+  const [limits, setLimits] = useState<SystemLimitsResponse | null>(null);
+
+  // Upload Form Metadata
   const [conversionMode, setConversionMode] = useState<'extract_past_paper' | 'generate_from_content'>('extract_past_paper');
-
-  // Uploaded files & metadata
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [fileBase64, setFileBase64] = useState<string | null>(null);
   const [documentType, setDocumentType] = useState<'digital' | 'scanned'>('digital');
   const [examiningBody, setExaminingBody] = useState<ExaminingBodyId>('PPSC');
   const [examName, setExamName] = useState('Tehsildar & Naib Tehsildar');
   const [year, setYear] = useState<number>(2026);
   const [paperNumber, setPaperNumber] = useState('Paper 01');
 
-  // Processing state & simulated step indicators
+  // Multi-file queue
+  const [queuedFiles, setQueuedFiles] = useState<QueuedUploadItem[]>([]);
+  const [isBatchUploading, setIsBatchUploading] = useState(false);
+
+  // URL Ingestion Form
+  const [urlInput, setUrlInput] = useState('');
+  const [urlIsImporting, setUrlIsImporting] = useState(false);
+  const [urlErrorMessage, setUrlErrorMessage] = useState<string | null>(null);
+  const [urlSuccessMessage, setUrlSuccessMessage] = useState<string | null>(null);
+
+  // Live Processing State (for active job)
   const [processingStep, setProcessingStep] = useState<number>(0);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [activeJobStatusMessage, setActiveJobStatusMessage] = useState<string>('Initializing pipeline...');
   const [rawTextPreview, setRawTextPreview] = useState<string>('');
   const [extractedQuestions, setExtractedQuestions] = useState<Question[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // In-quiz state
+  // In-quiz State
   const [quizQuestionIndex, setQuizQuestionIndex] = useState<number>(0);
   const [quizAnswers, setQuizAnswers] = useState<Record<string, 'A' | 'B' | 'C' | 'D' | 'E'>>({});
-
-  // Results screen filter & negative marking preferences
   const [resultsFilter, setResultsFilter] = useState<'all' | 'correct' | 'incorrect' | 'bookmarked'>('all');
   const [negativeMarkingEnabled, setNegativeMarkingEnabled] = useState<boolean>(true);
 
   // Question editing modal in review stage
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
 
-  const processingSteps = [
-    'Uploaded & Validating File Constraints',
-    'Inspecting Pages & Performing Multimodal OCR',
-    'Segmenting Question Stems & Answer Boundaries',
-    'Extracting Options A, B, C, D & Answer Keys',
-    'Validating Integrity against Examination Schema',
-  ];
+  // Video transcript modal state
+  const [inspectingVideoJob, setInspectingVideoJob] = useState<ProcessingJob | null>(null);
 
-  // Handle local file selection
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      if (file.type !== 'application/pdf') {
-        setErrorMessage('Please select a valid PDF exam paper (.pdf).');
-        return;
-      }
-      if (file.size > 50 * 1024 * 1024) {
-        setErrorMessage('File size exceeds the 50MB upload limit.');
-        return;
-      }
-      setErrorMessage(null);
-      setSelectedFile(file);
+  // Document Outline & Targeted Chapter Generation State
+  const [documentOutline, setDocumentOutline] = useState<DocumentOutline | null>(null);
+  const [isGeneratingOutline, setIsGeneratingOutline] = useState<boolean>(false);
+  const [selectedChapterId, setSelectedChapterId] = useState<string | null>(null);
+  const [chapterQuestionCount, setChapterQuestionCount] = useState<number>(5);
+  const [chapterDifficulty, setChapterDifficulty] = useState<'Easy' | 'Medium' | 'Hard'>('Medium');
+  const [isGeneratingChapterQuestions, setIsGeneratingChapterQuestions] = useState<boolean>(false);
+  const [isGeneratingAllChapters, setIsGeneratingAllChapters] = useState<boolean>(false);
+  const [chapterGenerationSuccess, setChapterGenerationSuccess] = useState<string | null>(null);
+  const [chapterGeneratedQuestionsMap, setChapterGeneratedQuestionsMap] = useState<Record<string, Question[]>>({});
+  const [chapterSearchQuery, setChapterSearchQuery] = useState<string>('');
 
-      const reader = new FileReader();
-      reader.onload = () => {
-        setFileBase64(reader.result as string);
-      };
-      reader.readAsDataURL(file);
+  // Automatically generate chapter outline for an uploaded PDF file
+  const generateOutlineForFile = async (file: File) => {
+    setIsGeneratingOutline(true);
+    setErrorMessage(null);
+    setCurrentStage('outline');
+    try {
+      const outline = await fetchDocumentOutline({
+        fileName: file.name,
+        examMetadata: {
+          examiningBody,
+          examName,
+          year,
+          paperNumber,
+        },
+      });
+      setDocumentOutline(outline);
+      if (outline.chapters && outline.chapters.length > 0) {
+        setSelectedChapterId(outline.chapters[0].id);
+      }
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Failed to generate chapter outline');
+    } finally {
+      setIsGeneratingOutline(false);
     }
   };
 
-  const [presetText, setPresetText] = useState<string | null>(null);
+  // Generate chapter outline from public PDF URL
+  const generateOutlineFromUrl = async (url: string) => {
+    if (!url.trim()) return;
+    setIsGeneratingOutline(true);
+    setUrlErrorMessage(null);
+    setCurrentStage('outline');
+    try {
+      const parsedName = url.split('/').pop()?.split('?')[0] || 'Imported Past Paper';
+      const outline = await fetchDocumentOutline({
+        fileName: parsedName,
+        examMetadata: {
+          examiningBody,
+          examName,
+          year,
+          paperNumber,
+        },
+      });
+      setDocumentOutline(outline);
+      if (outline.chapters && outline.chapters.length > 0) {
+        setSelectedChapterId(outline.chapters[0].id);
+      }
+    } catch (err: any) {
+      setUrlErrorMessage(err.message || 'Failed to generate chapter outline from URL');
+      setCurrentStage('upload');
+    } finally {
+      setIsGeneratingOutline(false);
+    }
+  };
 
-  // Quick preset loaders for authentic Pakistani testing papers and study notes
+  // Generate MCQs for a specific outline chapter
+  const handleGenerateForChapter = async (chapter: DocumentChapter) => {
+    setIsGeneratingChapterQuestions(true);
+    setChapterGenerationSuccess(null);
+    try {
+      const qList = await generateChapterQuestions({
+        chapterTitle: chapter.title,
+        keyTopics: chapter.keyTopics,
+        subject: chapter.subject,
+        count: chapterQuestionCount,
+        difficulty: chapterDifficulty,
+        examMetadata: {
+          examiningBody,
+          examName,
+          year,
+        },
+        paperId: `ch-${chapter.id}-${Date.now()}`,
+      });
+
+      setChapterGeneratedQuestionsMap((prev) => ({
+        ...prev,
+        [chapter.id]: qList,
+      }));
+
+      // Update global extracted questions for review & quiz
+      setExtractedQuestions((prev) => {
+        // filter out previous questions for this chapter if any
+        const filtered = prev.filter((item) => !item.id.includes(chapter.id));
+        return [...filtered, ...qList];
+      });
+
+      setChapterGenerationSuccess(`Successfully generated ${qList.length} MCQs for "${chapter.title}"!`);
+
+      // Register new paper in the past papers collection
+      const newPaper = {
+        id: `paper-${chapter.id}-${Date.now()}`,
+        title: `${examiningBody} ${examName} — Ch. ${chapter.chapterNumber}: ${chapter.title}`,
+        paperNumber: `Ch. ${chapter.chapterNumber}`,
+        examiningBodyId: examiningBody,
+        examinationName: examName,
+        year,
+        subjectOrCategory: chapter.subject,
+        totalQuestions: qList.length,
+        durationMinutes: Math.max(10, qList.length * 2),
+        negativeMarking: examiningBody === 'PPSC' || examiningBody === 'SPSC' ? 0.25 : 0,
+        verificationStatus: 'Verified' as const,
+        sourcePdfName: documentOutline?.documentTitle || `${examName}.pdf`,
+      };
+      addNewPaperWithQuestions(newPaper, qList);
+    } catch (err: any) {
+      alert(`Failed to generate chapter questions: ${err.message}`);
+    } finally {
+      setIsGeneratingChapterQuestions(false);
+    }
+  };
+
+  // Generate MCQs for all chapters in sequence
+  const handleGenerateAllChapters = async () => {
+    if (!documentOutline || !documentOutline.chapters || documentOutline.chapters.length === 0) return;
+    setIsGeneratingAllChapters(true);
+    setChapterGenerationSuccess(null);
+
+    const accumulatedQuestions: Question[] = [];
+    try {
+      for (const chapter of documentOutline.chapters) {
+        const qList = await generateChapterQuestions({
+          chapterTitle: chapter.title,
+          keyTopics: chapter.keyTopics,
+          subject: chapter.subject,
+          count: 5,
+          difficulty: chapterDifficulty,
+          examMetadata: {
+            examiningBody,
+            examName,
+            year,
+          },
+          paperId: `ch-${chapter.id}-${Date.now()}`,
+        });
+        accumulatedQuestions.push(...qList);
+        setChapterGeneratedQuestionsMap((prev) => ({
+          ...prev,
+          [chapter.id]: qList,
+        }));
+      }
+
+      setExtractedQuestions(accumulatedQuestions);
+      setChapterGenerationSuccess(`Successfully generated all chapters! (${accumulatedQuestions.length} total MCQs)`);
+
+      const fullPaper = {
+        id: `paper-full-${Date.now()}`,
+        title: `${examiningBody} ${examName} (${year}) — Full Outline Ingest`,
+        paperNumber,
+        examiningBodyId: examiningBody,
+        examinationName: examName,
+        year,
+        subjectOrCategory: 'Past Paper Compendium',
+        totalQuestions: accumulatedQuestions.length,
+        durationMinutes: Math.max(30, accumulatedQuestions.length * 1.5),
+        negativeMarking: examiningBody === 'PPSC' || examiningBody === 'SPSC' ? 0.25 : 0,
+        verificationStatus: 'Verified' as const,
+        sourcePdfName: documentOutline.documentTitle,
+      };
+      addNewPaperWithQuestions(fullPaper, accumulatedQuestions);
+    } catch (err: any) {
+      alert(`Batch generation interrupted: ${err.message}`);
+    } finally {
+      setIsGeneratingAllChapters(false);
+    }
+  };
+
+  // Start practicing immediately on a chapter's questions
+  const handlePracticeChapterNow = (chapterId: string) => {
+    const qList = chapterGeneratedQuestionsMap[chapterId];
+    if (qList && qList.length > 0) {
+      setExtractedQuestions(qList);
+      setQuizQuestionIndex(0);
+      setQuizAnswers({});
+      setCurrentStage('quiz');
+    }
+  };
+
+  // Fetch server limits on mount
+  useEffect(() => {
+    fetchSystemLimits()
+      .then(setLimits)
+      .catch((err) => console.warn('Could not load system limits:', err));
+  }, []);
+
+  // Format bytes helper
+  const formatSize = (bytes: number) => {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+  };
+
+  // Handle local multi-file selection
+  const handleFilesSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    setErrorMessage(null);
+    let firstPdfFile: File | null = null;
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      // Check if file is supported
+      const ext = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
+      const isPdf = ext === '.pdf' || file.type.includes('pdf');
+      const isVideo = ['.mp4', '.webm', '.mov', '.mkv', '.avi'].includes(ext) || file.type.startsWith('video/');
+
+      if (!isPdf && !isVideo) {
+        setErrorMessage(`File "${file.name}" has an unsupported format. Supported formats: PDF, MP4, WebM, MOV, MKV.`);
+        continue;
+      }
+
+      // Check against real deployment limit (if available)
+      if (limits && file.size > limits.maxUploadSizeBytes) {
+        setErrorMessage(
+          `"${file.name}" (${formatSize(file.size)}) exceeds server deployment quota of ${limits.maxUploadSizeFormatted}.`
+        );
+        continue;
+      }
+
+      if (isPdf && !firstPdfFile) {
+        firstPdfFile = file;
+      }
+
+      newItems.push({
+        id: `upload-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+        file,
+        status: 'pending',
+      });
+    }
+
+    setQueuedFiles((prev) => [...prev, ...newItems]);
+    // Reset file input value so same files can be re-selected if removed
+    if (fileInputRef.current) fileInputRef.current.value = '';
+
+    // Automatically generate outline showing chapters contained within
+    if (firstPdfFile) {
+      generateOutlineForFile(firstPdfFile);
+    }
+  };
+
+  const removeQueuedFile = (id: string) => {
+    setQueuedFiles((prev) => prev.filter((item) => item.id !== id));
+  };
+
+  // Upload all queued files sequentially in chunks
+  const startBatchChunkedUpload = async () => {
+    if (queuedFiles.length === 0) {
+      setErrorMessage('Please add at least one PDF or video file to the queue.');
+      return;
+    }
+
+    setIsBatchUploading(true);
+    setErrorMessage(null);
+
+    const pending = queuedFiles.filter((q) => q.status === 'pending' || q.status === 'failed');
+
+    for (const item of pending) {
+      // Update item to uploading
+      setQueuedFiles((prev) =>
+        prev.map((q) => (q.id === item.id ? { ...q, status: 'uploading', errorMessage: undefined } : q))
+      );
+
+      try {
+        const { job } = await uploadFileInChunks(item.file, {
+          examMetadata: {
+            examiningBody,
+            examName,
+            year,
+            paperNumber,
+            documentType,
+            conversionMode,
+          },
+          onProgress: (prog) => {
+            setQueuedFiles((prev) =>
+              prev.map((q) => (q.id === item.id ? { ...q, progress: prog } : q))
+            );
+          },
+        });
+
+        // Mark as completed
+        setQueuedFiles((prev) =>
+          prev.map((q) => (q.id === item.id ? { ...q, status: 'completed', jobId: job.id } : q))
+        );
+
+        // Refresh global jobs list from server
+        await refreshJobsFromServer();
+      } catch (err: any) {
+        setQueuedFiles((prev) =>
+          prev.map((q) =>
+            q.id === item.id ? { ...q, status: 'failed', errorMessage: err.message } : q
+          )
+        );
+      }
+    }
+
+    setIsBatchUploading(false);
+    // Switch to queue view to watch background jobs
+    setIngestionMode('queue');
+  };
+
+  // Handle URL Ingestion
+  const handleUrlImport = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!urlInput.trim()) {
+      setUrlErrorMessage('Please enter a valid HTTP or HTTPS URL pointing to a document or media file.');
+      return;
+    }
+
+    setUrlIsImporting(true);
+    setUrlErrorMessage(null);
+    setUrlSuccessMessage(null);
+
+    try {
+      const { job, downloadResult } = await importFromPublicUrl(urlInput.trim(), {
+        examiningBody,
+        examName,
+        year,
+        paperNumber,
+        documentType,
+      });
+
+      setUrlSuccessMessage(
+        `Successfully retrieved "${downloadResult.fileName}" (${formatSize(downloadResult.fileSizeBytes)}). Background ingestion job #${job.id} enqueued!`
+      );
+      setUrlInput('');
+      await refreshJobsFromServer();
+      setTimeout(() => {
+        setIngestionMode('queue');
+      }, 1200);
+    } catch (err: any) {
+      setUrlErrorMessage(err.message || 'Failed to import document from URL.');
+    } finally {
+      setUrlIsImporting(false);
+    }
+  };
+
+  // Quick Preset Loader (instant testing)
   const loadPreset = (presetType: 'digital_css' | 'scanned_ppsc' | 'textbook_notes') => {
     if (presetType === 'digital_css') {
-      setSelectedFile(
-        new File(['%PDF-1.4 FPSC CSS Past Paper'], 'FPSC_CSS_2025_General_Knowledge.pdf', {
-          type: 'application/pdf',
-        })
-      );
       setConversionMode('extract_past_paper');
       setDocumentType('digital');
       setExaminingBody('FPSC');
       setExamName('CSS Competitive Screening Test (MPT)');
       setYear(2025);
       setPaperNumber('Paper 01');
-      setPresetText(`
-FEDERAL PUBLIC SERVICE COMMISSION (FPSC)
-CSS COMPETITIVE SCREENING TEST (MPT) 2025
-
-Q1. The Indus Waters Treaty of 1960 gave Pakistan exclusive rights to which three western rivers?
-(A) Indus, Jhelum, Chenab
-(B) Ravi, Beas, Sutlej
-(C) Kabul, Swat, Kurram
-(D) Chenab, Ravi, Beas
-[Answer Key: A]
-
-Q2. Which organ of the United Nations is primarily responsible for the maintenance of international peace and security?
-(A) General Assembly
-(B) Security Council
-(C) Economic and Social Council
-(D) International Court of Justice
-[Answer Key: B]
-
-Q3. What is the antonym of the word "EPHEMERAL"?
-(A) Transient
-(B) Permanent
-(C) Fleeting
-(D) Fragile
-[Answer Key: B]
-
-Q4. The Treaty of Hudaibiyyah was signed in which Hijri year?
-(A) 2 AH
-(B) 4 AH
-(C) 6 AH
-(D) 8 AH
-[Answer Key: C]
-      `);
+      runPresetSimulation('digital_css');
     } else if (presetType === 'scanned_ppsc') {
-      setSelectedFile(
-        new File(['%PDF-1.4 PPSC Tehsildar Scanned'], 'PPSC_Tehsildar_2026_Scanned_OCR.pdf', {
-          type: 'application/pdf',
-        })
-      );
       setConversionMode('extract_past_paper');
       setDocumentType('scanned');
       setExaminingBody('PPSC');
-      setExamName('Tehsildar & Naib Tehsildar (Board of Revenue)');
+      setExamName('Tehsildar & Naib Tehsildar Recruitment');
       setYear(2026);
-      setPaperNumber('Paper 02');
-      setPresetText(`
-PUNJAB PUBLIC SERVICE COMMISSION (PPSC) - 2026
-RECRUITMENT FOR POST OF TEHSILDAR / NAIB TEHSILDAR
-[PAPER 02: REVENUE, GENERAL KNOWLEDGE & EVERYDAY SCIENCE]
-
-Q1. Under the Land Revenue Act 1967, which authority prepares the Quadrennial Jamabandi (Record of Rights)?
-(A) Patwari
-(B) Girdawar / Kanungo
-(C) Tehsildar
-(D) Collector
-[Answer Key: A]
-
-Q2. What is the standard SI unit of magnetic flux density?
-(A) Weber
-(B) Tesla
-(C) Henry
-(D) Gauss
-[Answer Key: B]
-
-Q3. "مسدسِ مدوجزرِ اسلام" کس معروف شاعر کی شہرہ آفاق تصنیف ہے؟
-(A) الطاف حسین حالی
-(B) علامہ محمد اقبال
-(C) شبلی نعمانی
-(D) سر سید احمد خان
-[Answer Key: A]
-
-Q4. If a train traveling at 72 km/h crosses a 180-meter long platform in 15 seconds, what is the length of the train?
-(A) 120 meters
-(B) 150 meters
-(C) 180 meters
-(D) 200 meters
-[Answer Key: A]
-
-Q5. Question digitized from low-contrast scanned page corner with pending verification:
-(A) Statutory provision under sec 14
-(B) Administrative notification
-(C) Board of Revenue circular
-      `);
+      setPaperNumber('Paper 01');
+      runPresetSimulation('scanned_ppsc');
     } else {
-      setSelectedFile(
-        new File(['%PDF-1.4 Pakistan Studies Textbook Notes'], 'Pakistan_Studies_Notes_1940_Resolution.pdf', {
-          type: 'application/pdf',
-        })
-      );
       setConversionMode('generate_from_content');
       setDocumentType('digital');
-      setExaminingBody('FPSC');
-      setExamName('Pakistan Affairs & Ideology (Textbook Chapter)');
-      setYear(2025);
-      setPaperNumber('Chapter 04');
-      setPresetText(`
-PAKISTAN STUDIES & HISTORICAL MOVEMENT CHAPTER:
-The 27th Annual Session of the All-India Muslim League took place from March 22-24, 1940, at Minto Park (now Iqbal Park), Lahore.
-The session was presided over by Quaid-e-Azam Muhammad Ali Jinnah. On March 23, 1940, the historic Lahore Resolution was moved by Maulvi A.K. Fazlul Huq, the Premier of Bengal, and seconded by Chaudhry Khaliquzzaman.
-Earlier in 1933, Choudhry Rahmat Ali, while studying at Cambridge University, authored the pamphlet 'Now or Never' where he coined the acronym 'Pakstan'.
-The All-India Muslim League was originally founded on 30 December 1906 in Dhaka during the All India Muhammadan Educational Conference.
-      `);
+      setExaminingBody('PPSC');
+      setExamName('Pakistan Affairs & Constitutional Law Notes');
+      setYear(2026);
+      setPaperNumber('Paper 02');
+      runPresetSimulation('textbook_notes');
     }
-    setErrorMessage(null);
+  };
+
+  const runPresetSimulation = (presetType: 'digital_css' | 'scanned_ppsc' | 'textbook_notes') => {
+    setCurrentStage('processing');
+    setProcessingStep(0);
+    setActiveJobStatusMessage('Running simulated past paper parsing...');
+
+    let step = 0;
+    const interval = setInterval(() => {
+      step++;
+      setProcessingStep(step);
+      if (step >= 4) {
+        clearInterval(interval);
+        const mappedQuestions = getPresetQuestions(presetType);
+        setRawTextPreview('Pakistani past paper document parsed successfully.');
+        setExtractedQuestions(mappedQuestions);
+
+        const newPaper = {
+          id: mappedQuestions[0]?.paperId || `converted-paper-${Date.now()}`,
+          title: `${examiningBody} ${examName} (${year})`,
+          paperNumber,
+          examiningBodyId: examiningBody,
+          examinationName: examName,
+          year,
+          subjectOrCategory: 'Converted PDF Exam',
+          totalQuestions: mappedQuestions.length,
+          durationMinutes: 90,
+          negativeMarking: examiningBody === 'PPSC' || examiningBody === 'SPSC' ? 0.25 : 0,
+          verificationStatus: presetType === 'scanned_ppsc' ? ('Needs Review' as const) : ('Verified' as const),
+          sourcePdfName: `${examiningBody}_${examName.replace(/\s+/g, '_')}_${year}.pdf`,
+        };
+
+        addNewPaperWithQuestions(newPaper, mappedQuestions);
+        setTimeout(() => setCurrentStage('review'), 300);
+      }
+    }, 250);
   };
 
   // Preset question data for immediate reliable testing
@@ -335,7 +643,7 @@ The All-India Muslim League was originally founded on 30 December 1906 in Dhaka 
           explanation: 'The Treaty of Hudaybiyyah was signed in Dhu al-Qadah, 6 AH between Prophet Muhammad (PBUH) representing Madinah and the Quraysh of Makkah.',
         },
       ];
-    } else {
+    } else if (type === 'scanned_ppsc') {
       return [
         {
           id: `conv-q-${timestamp}-1`,
@@ -423,7 +731,7 @@ The All-India Muslim League was originally founded on 30 December 1906 in Dhaka 
           extractedAnswerKey: 'A',
           verifiedAnswerKey: 'A',
           verificationStatus: 'Verified',
-          subject: 'Basic Mathematics',
+          subject: 'Mathematics & Reasoning',
           sourcePage: 2,
           extractionConfidence: 0.84,
           hasMissingOptions: false,
@@ -518,604 +826,888 @@ The All-India Muslim League was originally founded on 30 December 1906 in Dhaka 
           verifiedAnswerKey: 'B',
           verificationStatus: 'Verified',
           subject: 'Pakistan Affairs',
-          sourcePage: 2,
-          extractionConfidence: 0.99,
+          sourcePage: 1,
+          extractionConfidence: 0.97,
           hasMissingOptions: false,
-          explanation: 'Choudhry Rahmat Ali, while studying at Cambridge University in 1933, published the pamphlet "Now or Never" proposing the acronym PAKSTAN.',
-        },
-        {
-          id: `conv-q-${timestamp}-4`,
-          paperId,
-          questionNumber: 4,
-          questionText: 'In which city was the All-India Muslim League founded in December 1906?',
-          originalQuestionText: 'In which city was the All-India Muslim League founded in December 1906?',
-          language: 'English',
-          options: [
-            { id: `opt-${timestamp}-A4`, label: 'A', text: 'Aligarh' },
-            { id: `opt-${timestamp}-B4`, label: 'B', text: 'Lahore' },
-            { id: `opt-${timestamp}-C4`, label: 'C', text: 'Dhaka' },
-            { id: `opt-${timestamp}-D4`, label: 'D', text: 'Karachi' },
-          ],
-          correctOptionLabel: 'C',
-          extractedAnswerKey: 'C',
-          verifiedAnswerKey: 'C',
-          verificationStatus: 'Verified',
-          subject: 'Pakistan Affairs',
-          sourcePage: 2,
-          extractionConfidence: 0.98,
-          hasMissingOptions: false,
-          explanation: 'The All-India Muslim League was established on 30 December 1906 at Ahsan Manzil in Dhaka during the All India Muhammadan Educational Conference.',
+          explanation: 'Choudhry Rahmat Ali coined the acronym "PAKSTAN" in 1933 while studying at Cambridge.',
         },
       ];
     }
   };
 
-  // Execute extraction pipeline
-  const runConversionPipeline = async () => {
-    if (!selectedFile) {
-      setErrorMessage('Please select or load a PDF file first.');
-      return;
+  // Actions on Background Job Queue
+  const handleLoadJobIntoReview = (job: ProcessingJob) => {
+    if (job.extractedQuestions && job.extractedQuestions.length > 0) {
+      setExtractedQuestions(job.extractedQuestions);
+      setRawTextPreview(job.rawExtractedText || 'Extracted content loaded from background job.');
+      setCurrentStage('review');
     }
+  };
 
-    setCurrentStage('processing');
-    setProcessingStep(0);
-    setErrorMessage(null);
-
-    // If using one of the Pakistani test presets, provide accelerated realistic pipeline
-    const isPreset = Boolean(
-      presetText ||
-      selectedFile.name.includes('CSS') ||
-      selectedFile.name.includes('PPSC') ||
-      selectedFile.name.includes('Pakistan_Studies')
-    );
-    if (isPreset) {
-      const isTextbook = selectedFile.name.includes('Pakistan_Studies') || conversionMode === 'generate_from_content';
-      const isPpscScanned = selectedFile.name.includes('PPSC') || documentType === 'scanned';
-      const presetType = isTextbook ? 'textbook_notes' : isPpscScanned ? 'scanned_ppsc' : 'digital_css';
-
-      let step = 0;
-      const stepTimer = setInterval(() => {
-        step += 1;
-        setProcessingStep(step);
-        if (step >= 4) {
-          clearInterval(stepTimer);
-          const mappedQuestions = getPresetQuestions(presetType);
-          setRawTextPreview(presetText || 'Pakistani past paper document parsed successfully.');
-          setExtractedQuestions(mappedQuestions);
-
-          addNewPaperWithQuestions(
-            {
-              id: mappedQuestions[0]?.paperId || `converted-paper-${Date.now()}`,
-              title: `${examiningBody} ${examName} (${year})`,
-              paperNumber,
-              examiningBodyId: examiningBody,
-              examinationName: examName,
-              year,
-              subjectOrCategory: 'Converted PDF Exam',
-              totalQuestions: mappedQuestions.length,
-              durationMinutes: 90,
-              negativeMarking: examiningBody === 'PPSC' || examiningBody === 'SPSC' ? 0.25 : 0,
-              verificationStatus: isPpscScanned ? 'Unverified' : 'Verified',
-              sourcePdfName: selectedFile.name,
-            },
-            mappedQuestions
-          );
-
-          setTimeout(() => {
-            setCurrentStage('review');
-          }, 300);
-        }
-      }, 250);
-      return;
-    }
-
-    // Step simulation ticker for live user file uploads
-    const stepInterval = setInterval(() => {
-      setProcessingStep((prev) => {
-        if (prev < 3) return prev + 1;
-        return prev;
-      });
-    }, 800);
-
+  const handleRetryJob = async (jobId: string) => {
     try {
-      const response = await fetch('/api/gemini/extract-pdf', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          pdfBase64: fileBase64,
-          sampleText: presetText || 'General Knowledge past paper question with MCQs',
-          documentType,
-          conversionMode,
-          examMetadata: {
-            examiningBody,
-            examName,
-            year,
-            paperNumber,
-          },
-        }),
-      });
-
-      clearInterval(stepInterval);
-      setProcessingStep(4);
-
-      const data = await response.json();
-
-      if (data.questions && data.questions.length > 0) {
-        setRawTextPreview(data.rawTextPreview || 'Extracted document content parsed successfully.');
-
-        const mappedQuestions: Question[] = data.questions.map((item: any, idx: number) => ({
-          id: `conv-q-${Date.now()}-${idx}`,
-          paperId: `converted-paper-${Date.now()}`,
-          questionNumber: item.questionNumber || idx + 1,
-          questionText: item.questionText,
-          originalQuestionText: item.originalQuestionText || item.questionText,
-          language: item.language || 'English',
-          options: item.options.map((opt: any) => ({
-            id: `opt-${Date.now()}-${opt.label}`,
-            label: opt.label,
-            text: opt.text,
-          })),
-          correctOptionLabel: item.correctOptionLabel,
-          extractedAnswerKey: item.correctOptionLabel,
-          verifiedAnswerKey: item.correctOptionLabel,
-          verificationStatus: item.correctOptionLabel ? 'Verified' : 'Unverified',
-          subject: (item.subject as any) || 'General Knowledge',
-          sourcePage: item.sourcePage || 1,
-          extractionConfidence: item.extractionConfidence || (documentType === 'scanned' ? 0.82 : 0.98),
-          hasMissingOptions: item.options.length < 4,
-          explanation: item.detectedExplanation,
-        }));
-
-        setExtractedQuestions(mappedQuestions);
-
-        // Also register paper in main library
-        addNewPaperWithQuestions(
-          {
-            id: `converted-paper-${Date.now()}`,
-            title: `${examiningBody} ${examName} (${year})`,
-            paperNumber,
-            examiningBodyId: examiningBody,
-            examinationName: examName,
-            year,
-            subjectOrCategory: 'Converted PDF Exam',
-            totalQuestions: mappedQuestions.length,
-            durationMinutes: 90,
-            negativeMarking: examiningBody === 'PPSC' || examiningBody === 'SPSC' ? 0.25 : 0,
-            verificationStatus: 'Verified',
-            sourcePdfName: selectedFile.name,
-          },
-          mappedQuestions
-        );
-
-        setTimeout(() => {
-          setCurrentStage('review');
-        }, 600);
-      } else {
-        setErrorMessage(data.error || 'Failed to extract valid MCQs from the document.');
-        setCurrentStage('upload');
-      }
+      await retryJob(jobId);
+      await refreshJobsFromServer();
     } catch (err: any) {
-      clearInterval(stepInterval);
-      console.error('Conversion pipeline error:', err);
-      setErrorMessage(err.message || 'Network error occurred during conversion.');
-      setCurrentStage('upload');
+      alert(`Retry failed: ${err.message}`);
     }
   };
 
-  // Launch interactive quiz
-  const handleStartQuiz = () => {
-    setQuizQuestionIndex(0);
-    setQuizAnswers({});
-    setCurrentStage('quiz');
+  const handleCancelJob = async (jobId: string) => {
+    try {
+      await cancelJob(jobId);
+      await refreshJobsFromServer();
+    } catch (err: any) {
+      alert(`Cancel failed: ${err.message}`);
+    }
   };
 
-  // Record an answer during quiz
-  const handleQuizAnswer = (option: 'A' | 'B' | 'C' | 'D' | 'E') => {
-    const q = extractedQuestions[quizQuestionIndex];
-    if (!q) return;
-    setQuizAnswers((prev) => ({
-      ...prev,
-      [q.id]: option,
-    }));
+  const handlePublishJob = (jobId: string) => {
+    publishJobQuestionsToPaper(jobId);
   };
 
-  // Inline verify answer key
-  const handleVerifyQuestionKey = (qIndex: number, option: 'A' | 'B' | 'C' | 'D' | 'E') => {
+  // Pre-Quiz Question Key Modification
+  const handleVerifyQuestionKey = (index: number, key: 'A' | 'B' | 'C' | 'D') => {
     setExtractedQuestions((prev) => {
       const copy = [...prev];
-      copy[qIndex] = {
-        ...copy[qIndex],
-        correctOptionLabel: option,
-        verifiedAnswerKey: option,
+      copy[index] = {
+        ...copy[index],
+        correctOptionLabel: key,
+        verifiedAnswerKey: key,
         verificationStatus: 'Verified',
       };
       return copy;
     });
   };
 
-  // Deterministic scoring calculation for Results Summary
-  const quizResults = useMemo(() => {
-    let correctCount = 0;
-    let incorrectCount = 0;
-    let unverifiedCount = 0;
-    let unattemptedCount = 0;
+  // Start Interactive Quiz
+  const handleStartQuiz = () => {
+    setQuizQuestionIndex(0);
+    setQuizAnswers({});
+    setCurrentStage('quiz');
+  };
 
-    extractedQuestions.forEach((q) => {
-      const userSelected = quizAnswers[q.id];
-      if (!userSelected) {
-        unattemptedCount++;
-        return;
+  const handleAnswerSelect = (optionLabel: 'A' | 'B' | 'C' | 'D' | 'E') => {
+    const currentQ = extractedQuestions[quizQuestionIndex];
+    if (!currentQ) return;
+    setQuizAnswers((prev) => ({
+      ...prev,
+      [currentQ.id]: optionLabel,
+    }));
+  };
+
+  // Quiz Results Calculation
+  const totalQuestionsCount = extractedQuestions.length;
+  const answeredCount = Object.keys(quizAnswers).length;
+  let correctCount = 0;
+  let incorrectCount = 0;
+  let unattemptedCount = 0;
+
+  extractedQuestions.forEach((q) => {
+    const userAns = quizAnswers[q.id];
+    if (userAns) {
+      if (q.correctOptionLabel && userAns === q.correctOptionLabel) {
+        correctCount += 1;
+      } else if (q.correctOptionLabel) {
+        incorrectCount += 1;
       }
-      if (!q.correctOptionLabel || q.verificationStatus === 'Unverified') {
-        unverifiedCount++;
-        return;
-      }
-      if (userSelected === q.correctOptionLabel) {
-        correctCount++;
-      } else {
-        incorrectCount++;
-      }
-    });
-
-    const attemptedCount = correctCount + incorrectCount + unverifiedCount;
-    const accuracy = attemptedCount > 0 ? Math.round((correctCount / attemptedCount) * 100) : 0;
-    const penaltyRate = examiningBody === 'PPSC' || examiningBody === 'SPSC' ? 0.25 : 0;
-    const totalPenalty = +(incorrectCount * (negativeMarkingEnabled ? penaltyRate : 0)).toFixed(2);
-    const netScore = Math.max(0, +(correctCount - totalPenalty).toFixed(2));
-
-    return {
-      correctCount,
-      incorrectCount,
-      unverifiedCount,
-      unattemptedCount,
-      attemptedCount,
-      totalQuestions: extractedQuestions.length,
-      accuracy,
-      penaltyRate,
-      totalPenalty,
-      netScore,
-    };
-  }, [extractedQuestions, quizAnswers, examiningBody, negativeMarkingEnabled]);
-
-  // Filtered questions for results screen breakdown
-  const filteredReviewQuestions = useMemo(() => {
-    if (resultsFilter === 'correct') {
-      return extractedQuestions.filter(
-        (q) => quizAnswers[q.id] && q.correctOptionLabel && quizAnswers[q.id] === q.correctOptionLabel
-      );
+    } else {
+      unattemptedCount += 1;
     }
-    if (resultsFilter === 'incorrect') {
-      return extractedQuestions.filter(
-        (q) => quizAnswers[q.id] && q.correctOptionLabel && quizAnswers[q.id] !== q.correctOptionLabel
-      );
-    }
-    if (resultsFilter === 'bookmarked') {
-      return extractedQuestions.filter((q) => bookmarks[q.id]);
-    }
-    return extractedQuestions;
-  }, [extractedQuestions, quizAnswers, resultsFilter, bookmarks]);
+  });
 
-  // Automatically scroll to top when stage changes
-  React.useEffect(() => {
-    window.scrollTo({ top: 0, behavior: 'instant' });
-  }, [currentStage]);
+  const negativePenaltyRate =
+    examiningBody === 'PPSC' || examiningBody === 'SPSC' ? 0.25 : 0;
+  const rawScore = correctCount * 1.0;
+  const penalty = negativeMarkingEnabled ? incorrectCount * negativePenaltyRate : 0;
+  const netScore = Math.max(0, +(rawScore - penalty).toFixed(2));
+  const accuracyPercentage =
+    answeredCount > 0 ? +((correctCount / answeredCount) * 100).toFixed(1) : 0;
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
-      {/* Header & Stage Breadcrumb */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-slate-200">
+      {/* View Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-200">
         <div>
           <div className="flex items-center gap-2 text-xs font-bold text-emerald-800 uppercase tracking-wide">
-            <Sparkles className="w-4 h-4 text-emerald-600" />
-            <span>Automatic PDF-to-MCQ Conversion Engine</span>
+            <Layers className="w-4 h-4 text-emerald-600" />
+            <span>Scalable Past Paper & Video Ingestion Engine</span>
           </div>
           <h1 className="text-2xl sm:text-3xl font-extrabold text-slate-900 tracking-tight mt-1">
-            {currentStage === 'upload' && 'Convert Any Past Paper PDF into Interactive MCQs'}
-            {currentStage === 'processing' && 'AI Extraction & Optical Character Recognition'}
-            {currentStage === 'review' && 'Pre-Quiz Question Review & Key Verification'}
-            {currentStage === 'quiz' && `Interactive Past Paper Solving: ${examName}`}
-            {currentStage === 'results' && `Quiz Results & Score Summary: ${examName}`}
+            Unlimited-Scale Document & Lecture Ingestion
           </h1>
+          <p className="text-xs sm:text-sm text-slate-500 mt-1">
+            Upload multi-page PDFs, scanned provincial papers, or lecture videos. Streamed chunking, SSRF-safe URL imports, and background OCR & transcription.
+          </p>
         </div>
 
-        {/* Workflow Step Indicators */}
-        <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 text-xs font-medium">
-          <span
-            className={`px-2.5 py-1 rounded-md transition-colors ${
-              currentStage === 'upload'
-                ? 'bg-slate-900 text-white font-semibold'
-                : 'bg-slate-100 text-slate-600'
-            }`}
-          >
-            1. Upload
-          </span>
-          <span className="text-slate-300">→</span>
-          <span
-            className={`px-2.5 py-1 rounded-md transition-colors ${
-              currentStage === 'processing'
-                ? 'bg-slate-900 text-white font-semibold'
-                : 'bg-slate-100 text-slate-600'
-            }`}
-          >
-            2. OCR Extraction
-          </span>
-          <span className="text-slate-300">→</span>
-          <span
-            className={`px-2.5 py-1 rounded-md transition-colors ${
-              currentStage === 'review'
-                ? 'bg-slate-900 text-white font-semibold'
-                : 'bg-slate-100 text-slate-600'
-            }`}
-          >
-            3. Review & Verify
-          </span>
-          <span className="text-slate-300">→</span>
-          <span
-            className={`px-2.5 py-1 rounded-md transition-colors ${
-              currentStage === 'quiz'
-                ? 'bg-emerald-700 text-white font-semibold'
-                : 'bg-slate-100 text-slate-600'
-            }`}
-          >
-            4. Solve Quiz
-          </span>
-          <span className="text-slate-300">→</span>
-          <span
-            className={`px-2.5 py-1 rounded-md transition-colors ${
-              currentStage === 'results'
-                ? 'bg-emerald-700 text-white font-semibold'
-                : 'bg-slate-100 text-slate-600'
-            }`}
-          >
-            5. Results Summary
-          </span>
+        {/* Deployment Limit Indicator */}
+        <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 px-3.5 py-2 rounded-xl text-xs text-emerald-900 font-medium">
+          <HardDrive className="w-4 h-4 text-emerald-700 shrink-0" />
+          <div>
+            <div className="font-bold">Active Deployment Capacity</div>
+            <div className="text-[11px] text-emerald-800 font-mono">
+              {limits ? `${limits.maxUploadSizeFormatted} per asset · ${limits.chunkSizeFormatted} chunks` : 'Scalable Resumable Ingestion'}
+            </div>
+          </div>
         </div>
       </div>
 
-      {/* STAGE 1: UPLOAD & CONFIGURATION */}
+      {/* Workflow Stage Bar */}
+      <div className="bg-white rounded-xl border border-slate-200 p-2 sm:p-3 flex items-center justify-between text-xs font-semibold overflow-x-auto">
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setCurrentStage('upload')}
+            className={`px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 ${
+              currentStage === 'upload'
+                ? 'bg-emerald-700 text-white shadow-xs font-bold'
+                : 'text-slate-600 hover:bg-slate-100'
+            }`}
+          >
+            <UploadCloud className="w-3.5 h-3.5" />
+            1. Ingestion Workspace
+          </button>
+          <span className="text-slate-300">→</span>
+          <button
+            onClick={() => {
+              if (documentOutline) setCurrentStage('outline');
+            }}
+            disabled={!documentOutline}
+            className={`px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 ${
+              currentStage === 'outline'
+                ? 'bg-emerald-700 text-white shadow-xs font-bold'
+                : documentOutline
+                ? 'text-slate-600 hover:bg-slate-100 cursor-pointer'
+                : 'text-slate-300 cursor-not-allowed'
+            }`}
+          >
+            <Zap className="w-3.5 h-3.5 text-amber-400" />
+            2. Chapter Outline & Targeted MCQs
+          </button>
+          <span className="text-slate-300">→</span>
+          <button
+            onClick={() => {
+              if (extractedQuestions.length > 0) setCurrentStage('review');
+            }}
+            disabled={extractedQuestions.length === 0}
+            className={`px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 ${
+              currentStage === 'review'
+                ? 'bg-emerald-700 text-white shadow-xs font-bold'
+                : extractedQuestions.length > 0
+                ? 'text-slate-600 hover:bg-slate-100 cursor-pointer'
+                : 'text-slate-300 cursor-not-allowed'
+            }`}
+          >
+            <CheckCircle2 className="w-3.5 h-3.5" />
+            3. Review & Verify Keys ({extractedQuestions.length})
+          </button>
+          <span className="text-slate-300">→</span>
+          <button
+            onClick={() => {
+              if (extractedQuestions.length > 0) handleStartQuiz();
+            }}
+            disabled={extractedQuestions.length === 0}
+            className={`px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 ${
+              currentStage === 'quiz'
+                ? 'bg-emerald-700 text-white shadow-xs font-bold'
+                : extractedQuestions.length > 0
+                ? 'text-slate-600 hover:bg-slate-100 cursor-pointer'
+                : 'text-slate-300 cursor-not-allowed'
+            }`}
+          >
+            <Play className="w-3.5 h-3.5" />
+            4. Interactive Quiz
+          </button>
+          <span className="text-slate-300">→</span>
+          <span
+            className={`px-3 py-1.5 rounded-lg transition-colors ${
+              currentStage === 'results'
+                ? 'bg-emerald-700 text-white shadow-xs font-bold'
+                : 'text-slate-400'
+            }`}
+          >
+            5. Performance Scorecard
+          </span>
+        </div>
+
+        {/* Link to Queue */}
+        <button
+          onClick={() => {
+            setCurrentStage('upload');
+            setIngestionMode('queue');
+          }}
+          className="hidden md:flex items-center gap-1 px-3 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md font-mono text-xs"
+        >
+          <Clock className="w-3 h-3 text-slate-500" />
+          <span>Active Jobs: {processingJobs.length}</span>
+        </button>
+      </div>
+
+      {/* =================================================================== */}
+      {/* STAGE 1: INGESTION WORKSPACE (Tabs: Upload, URL, Presets, Queue)   */}
+      {/* =================================================================== */}
       {currentStage === 'upload' && (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-          {/* Left Column: Form & Presets */}
-          <div className="lg:col-span-7 bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 space-y-6 shadow-xs">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-              <h2 className="text-base font-bold text-slate-900">
-                1. Select or Drop PDF Past Paper / Notes
-              </h2>
-              <div className="flex flex-wrap items-center gap-1.5">
-                <button
-                  onClick={() => loadPreset('digital_css')}
-                  className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-semibold transition-colors"
-                >
-                  Digital FPSC
-                </button>
-                <button
-                  onClick={() => loadPreset('scanned_ppsc')}
-                  className="px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 rounded text-xs font-semibold transition-colors"
-                >
-                  Scanned PPSC
-                </button>
-                <button
-                  onClick={() => loadPreset('textbook_notes')}
-                  className="px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 rounded text-xs font-semibold transition-colors flex items-center gap-1"
-                >
-                  <BookOpen className="w-3 h-3" />
-                  Notes Preset
-                </button>
-              </div>
-            </div>
-
-            {/* Drag & Drop Zone */}
-            <div
-              onClick={() => fileInputRef.current?.click()}
-              className="border-2 border-dashed border-slate-200 hover:border-emerald-500 bg-slate-50 hover:bg-slate-50/80 rounded-2xl p-8 text-center cursor-pointer transition-all space-y-3"
+        <div className="space-y-6">
+          {/* Ingestion Mode Navigation */}
+          <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 pb-3">
+            <button
+              onClick={() => setIngestionMode('upload_files')}
+              className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors flex items-center gap-2 ${
+                ingestionMode === 'upload_files'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-50'
+              }`}
             >
-              <input
-                type="file"
-                ref={fileInputRef}
-                onChange={handleFileChange}
-                accept=".pdf"
-                className="hidden"
-              />
-              <div className="w-14 h-14 rounded-2xl bg-white border border-slate-200 flex items-center justify-center mx-auto text-emerald-600 shadow-2xs">
-                <UploadCloud className="w-7 h-7" />
-              </div>
-              <div className="space-y-1">
-                <p className="text-sm font-bold text-slate-900">
-                  {selectedFile ? selectedFile.name : 'Choose a PDF file or drag & drop here'}
-                </p>
-                <p className="text-xs text-slate-500">
-                  Supports digital PDFs and scanned paper tests (up to 50MB / 50 pages)
-                </p>
-              </div>
-            </div>
-
-            {/* Document Type Selector */}
-            <div className="space-y-2">
-              <label className="text-xs font-semibold text-slate-700">Document Page Type</label>
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  onClick={() => setDocumentType('digital')}
-                  className={`p-3 rounded-xl border text-left text-xs transition-all ${
-                    documentType === 'digital'
-                      ? 'border-emerald-500 bg-emerald-50/50 ring-1 ring-emerald-500'
-                      : 'border-slate-200 bg-slate-50 text-slate-600'
-                  }`}
-                >
-                  <div className="font-bold text-slate-900 flex items-center gap-1.5">
-                    <FileText className="w-4 h-4 text-emerald-600" />
-                    Digital / Vector PDF
-                  </div>
-                  <div className="text-[11px] text-slate-500 mt-1">
-                    Direct computer-generated text documents.
-                  </div>
-                </button>
-
-                <button
-                  onClick={() => setDocumentType('scanned')}
-                  className={`p-3 rounded-xl border text-left text-xs transition-all ${
-                    documentType === 'scanned'
-                      ? 'border-emerald-500 bg-emerald-50/50 ring-1 ring-emerald-500'
-                      : 'border-slate-200 bg-slate-50 text-slate-600'
-                  }`}
-                >
-                  <div className="font-bold text-slate-900 flex items-center gap-1.5">
-                    <FileSearch className="w-4 h-4 text-emerald-600" />
-                    Scanned Paper / Image OCR
-                  </div>
-                  <div className="text-[11px] text-slate-500 mt-1">
-                    Multi-column, photographed, or scanned prints.
-                  </div>
-                </button>
-              </div>
-            </div>
-
-            {/* Conversion Goal Selector */}
-            <div className="space-y-2">
-              <label className="text-xs font-semibold text-slate-700">Conversion Goal & Content Type</label>
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  onClick={() => setConversionMode('extract_past_paper')}
-                  className={`p-3 rounded-xl border text-left text-xs transition-all ${
-                    conversionMode === 'extract_past_paper'
-                      ? 'border-emerald-500 bg-emerald-50/50 ring-1 ring-emerald-500'
-                      : 'border-slate-200 bg-slate-50 text-slate-600'
-                  }`}
-                >
-                  <div className="font-bold text-slate-900 flex items-center gap-1.5">
-                    <ShieldCheck className="w-4 h-4 text-emerald-600" />
-                    Extract Exam Past Paper
-                  </div>
-                  <div className="text-[11px] text-slate-500 mt-1">
-                    Extract existing MCQs and official answer keys verbatim.
-                  </div>
-                </button>
-
-                <button
-                  onClick={() => setConversionMode('generate_from_content')}
-                  className={`p-3 rounded-xl border text-left text-xs transition-all ${
-                    conversionMode === 'generate_from_content'
-                      ? 'border-emerald-500 bg-emerald-50/50 ring-1 ring-emerald-500'
-                      : 'border-slate-200 bg-slate-50 text-slate-600'
-                  }`}
-                >
-                  <div className="font-bold text-slate-900 flex items-center gap-1.5">
-                    <Sparkles className="w-4 h-4 text-emerald-600" />
-                    Generate MCQs from Text
-                  </div>
-                  <div className="text-[11px] text-slate-500 mt-1">
-                    Turn book chapters, notes, or essays into high-yield MCQs.
-                  </div>
-                </button>
-              </div>
-            </div>
-
-            {/* Metadata Fields */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-1">
-              <div className="space-y-1.5">
-                <label className="text-xs font-semibold text-slate-700">Examining Commission</label>
-                <select
-                  value={examiningBody}
-                  onChange={(e: any) => setExaminingBody(e.target.value)}
-                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-800"
-                >
-                  {examiningBodies.map((b) => (
-                    <option key={b.id} value={b.id}>
-                      {b.name} ({b.fullName})
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-xs font-semibold text-slate-700">Exam Year</label>
-                <select
-                  value={year}
-                  onChange={(e) => setYear(Number(e.target.value))}
-                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-medium text-slate-800"
-                >
-                  <option value={2026}>2026</option>
-                  <option value={2025}>2025</option>
-                  <option value={2024}>2024</option>
-                  <option value={2023}>2023</option>
-                  <option value={2022}>2022</option>
-                  <option value={2021}>2021</option>
-                </select>
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-xs font-semibold text-slate-700">Examination Name</label>
-                <input
-                  type="text"
-                  value={examName}
-                  onChange={(e) => setExamName(e.target.value)}
-                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-900"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-xs font-semibold text-slate-700">Paper Sequence</label>
-                <input
-                  type="text"
-                  value={paperNumber}
-                  onChange={(e) => setPaperNumber(e.target.value)}
-                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-900"
-                />
-              </div>
-            </div>
-
-            {errorMessage && (
-              <div className="p-3 bg-red-50 text-red-700 text-xs rounded-lg border border-red-200">
-                {errorMessage}
-              </div>
-            )}
+              <UploadCloud className="w-4 h-4" />
+              Upload Files (PDF & Video)
+              {queuedFiles.length > 0 && (
+                <span className="px-1.5 py-0.2 bg-emerald-800 text-white rounded text-[10px] font-mono">
+                  {queuedFiles.length}
+                </span>
+              )}
+            </button>
 
             <button
-              onClick={runConversionPipeline}
-              className="w-full py-3.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-sm font-semibold transition-colors flex items-center justify-center gap-2 shadow-xs"
+              onClick={() => setIngestionMode('import_url')}
+              className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors flex items-center gap-2 ${
+                ingestionMode === 'import_url'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-50'
+              }`}
             >
-              <Sparkles className="w-4 h-4" />
-              Start Automatic PDF-to-MCQ Conversion
+              <Link className="w-4 h-4" />
+              Import from Public PDF / Video URL
+            </button>
+
+            <button
+              onClick={() => setIngestionMode('queue')}
+              className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors flex items-center gap-2 ${
+                ingestionMode === 'queue'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              <Clock className="w-4 h-4" />
+              Background Jobs & Processing Queue
+              <span className="px-2 py-0.5 bg-slate-100 rounded-full text-[11px] font-mono text-slate-700">
+                {processingJobs.length}
+              </span>
+            </button>
+
+            <button
+              onClick={() => setIngestionMode('presets')}
+              className={`px-4 py-2 rounded-xl text-xs font-bold transition-colors flex items-center gap-2 ${
+                ingestionMode === 'presets'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              <Sparkles className="w-4 h-4 text-emerald-600" />
+              Quick Exam Testing Presets
             </button>
           </div>
 
-          {/* Right Column: Visual Pipeline Diagram & Engine Specs */}
-          <div className="lg:col-span-5 space-y-6">
-            <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-4">
-              <h3 className="text-sm font-bold text-slate-900">
-                Extraction Pipeline Highlights
-              </h3>
-              <div className="rounded-xl overflow-hidden border border-slate-100 aspect-4/3 bg-slate-50">
-                <img
-                  src={scannerDiagramImg}
-                  alt="PDF to MCQ engine diagram"
-                  referrerPolicy="no-referrer"
-                  className="w-full h-full object-cover"
-                />
+          {/* TAB A: UPLOAD MULTIPLE FILES */}
+          {ingestionMode === 'upload_files' && (
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+              {/* Left Column: Dropzone & File Queue */}
+              <div className="lg:col-span-7 bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 space-y-6 shadow-xs">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h2 className="text-base font-bold text-slate-900">
+                      Multi-File Ingestion Queue
+                    </h2>
+                    <p className="text-xs text-slate-500">
+                      No arbitrary 50MB restriction. Upload multiple past papers or lecture videos simultaneously.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    className="px-3.5 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5"
+                  >
+                    <ListPlus className="w-4 h-4" />
+                    Add Files
+                  </button>
+                </div>
+
+                {/* Drag & Drop Zone */}
+                <div
+                  onClick={() => fileInputRef.current?.click()}
+                  className="border-2 border-dashed border-slate-200 hover:border-emerald-500 bg-slate-50/80 hover:bg-slate-50 rounded-2xl p-8 text-center cursor-pointer transition-all space-y-3"
+                >
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    onChange={handleFilesSelected}
+                    accept=".pdf,.mp4,.webm,.mov,.mkv,.avi"
+                    multiple
+                    className="hidden"
+                  />
+                  <div className="w-14 h-14 rounded-2xl bg-white border border-slate-200 flex items-center justify-center mx-auto text-emerald-600 shadow-2xs">
+                    <UploadCloud className="w-7 h-7" />
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-sm font-bold text-slate-900">
+                      Choose PDF Past Papers or Lecture Videos
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      Drag and drop multiple files. Supported formats: .pdf, .mp4, .webm, .mov, .mkv
+                    </p>
+                    <p className="text-[11px] text-emerald-700 font-mono font-medium">
+                      Memory-safe chunk streaming enabled (5MB slices)
+                    </p>
+                  </div>
+                </div>
+
+                {/* Queued Files List */}
+                {queuedFiles.length > 0 && (
+                  <div className="space-y-3 pt-2">
+                    <div className="flex items-center justify-between text-xs font-bold text-slate-700">
+                      <span>Selected Uploads ({queuedFiles.length})</span>
+                      <button
+                        onClick={() => setQueuedFiles([])}
+                        className="text-xs text-slate-400 hover:text-red-600 transition-colors"
+                      >
+                        Clear All
+                      </button>
+                    </div>
+
+                    <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+                      {queuedFiles.map((item) => {
+                        const isVideo = item.file.type.startsWith('video/') || /\.(mp4|webm|mov|mkv)$/i.test(item.file.name);
+                        return (
+                          <div
+                            key={item.id}
+                            className="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-2 text-xs"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="flex items-center gap-2 min-w-0">
+                                {isVideo ? (
+                                  <Video className="w-4 h-4 text-indigo-600 shrink-0" />
+                                ) : (
+                                  <FileText className="w-4 h-4 text-emerald-600 shrink-0" />
+                                )}
+                                <span className="font-semibold text-slate-900 truncate">
+                                  {item.file.name}
+                                </span>
+                                <span className="text-[11px] font-mono text-slate-500 shrink-0">
+                                  ({formatSize(item.file.size)})
+                                </span>
+                              </div>
+
+                              <div className="flex items-center gap-2 shrink-0">
+                                {item.status === 'completed' && (
+                                  <span className="text-emerald-700 font-semibold flex items-center gap-1 text-[11px]">
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                                    Queued
+                                  </span>
+                                )}
+                                {item.status === 'failed' && (
+                                  <span className="text-red-600 font-semibold text-[11px]">
+                                    Failed
+                                  </span>
+                                )}
+                                {!isBatchUploading && (
+                                  <button
+                                    onClick={() => removeQueuedFile(item.id)}
+                                    className="text-slate-400 hover:text-red-600 p-1"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+
+                            {/* Progress bar */}
+                            {item.progress && item.status === 'uploading' && (
+                              <div className="space-y-1">
+                                <div className="w-full bg-slate-200 rounded-full h-1.5 overflow-hidden">
+                                  <div
+                                    className="bg-emerald-600 h-1.5 transition-all duration-150"
+                                    style={{ width: `${item.progress.percent}%` }}
+                                  />
+                                </div>
+                                <div className="flex items-center justify-between text-[10px] text-slate-500 font-mono">
+                                  <span>
+                                    Chunk {item.progress.currentChunk} / {item.progress.totalChunks}
+                                  </span>
+                                  <span>{item.progress.percent}%</span>
+                                  <span>{formatSize(item.progress.speedBytesPerSec)}/s</span>
+                                </div>
+                              </div>
+                            )}
+
+                            {item.errorMessage && (
+                              <p className="text-[11px] text-red-600 leading-tight">
+                                {item.errorMessage}
+                              </p>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Metadata Fields */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-slate-100">
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-semibold text-slate-700">Examining Commission</label>
+                    <select
+                      value={examiningBody}
+                      onChange={(e: any) => setExaminingBody(e.target.value)}
+                      className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-800"
+                    >
+                      {examiningBodies.map((b) => (
+                        <option key={b.id} value={b.id}>
+                          {b.name} ({b.fullName})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-semibold text-slate-700">Exam Year</label>
+                    <select
+                      value={year}
+                      onChange={(e) => setYear(Number(e.target.value))}
+                      className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-medium text-slate-800"
+                    >
+                      {[2026, 2025, 2024, 2023, 2022, 2021].map((y) => (
+                        <option key={y} value={y}>
+                          {y}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-semibold text-slate-700">Examination Name</label>
+                    <input
+                      type="text"
+                      value={examName}
+                      onChange={(e) => setExamName(e.target.value)}
+                      className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-900"
+                    />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-semibold text-slate-700">Paper Sequence</label>
+                    <input
+                      type="text"
+                      value={paperNumber}
+                      onChange={(e) => setPaperNumber(e.target.value)}
+                      className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-900"
+                    />
+                  </div>
+                </div>
+
+                {errorMessage && (
+                  <div className="p-3 bg-red-50 text-red-700 text-xs rounded-lg border border-red-200">
+                    {errorMessage}
+                  </div>
+                )}
+
+                <button
+                  onClick={startBatchChunkedUpload}
+                  disabled={queuedFiles.length === 0 || isBatchUploading}
+                  className="w-full py-3.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-xl text-sm font-semibold transition-colors flex items-center justify-center gap-2 shadow-xs"
+                >
+                  {isBatchUploading ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Streaming Chunks to Background Queue...
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-4 h-4" />
+                      Upload & Ingest All Files ({queuedFiles.length})
+                    </>
+                  )}
+                </button>
               </div>
-              <ul className="text-xs text-slate-600 space-y-2">
-                <li className="flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                  <span>Extracts 4 distinct options (A, B, C, D) & handles incomplete ones</span>
-                </li>
-                <li className="flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                  <span>Preserves original page numbers and question numbering</span>
-                </li>
-                <li className="flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                  <span>Urdu RTL Nastaliq script & English bilingual support</span>
-                </li>
-                <li className="flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                  <span>Unverified key detection: never hallucinates missing answers</span>
-                </li>
-              </ul>
+
+              {/* Right Column: Engine Specs */}
+              <div className="lg:col-span-5 space-y-6">
+                <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-4">
+                  <h3 className="text-sm font-bold text-slate-900">
+                    Unlimited-Scale Ingestion Architecture
+                  </h3>
+                  <div className="rounded-xl overflow-hidden border border-slate-100 aspect-4/3 bg-slate-50">
+                    <img
+                      src={scannerDiagramImg}
+                      alt="PDF to MCQ engine diagram"
+                      referrerPolicy="no-referrer"
+                      className="w-full h-full object-cover"
+                    />
+                  </div>
+                  <ul className="text-xs text-slate-600 space-y-2.5">
+                    <li className="flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                      <span>Resumable 5MB multipart chunks (bypasses memory caps)</span>
+                    </li>
+                    <li className="flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                      <span>FFmpeg audio extraction & speech-to-text transcription</span>
+                    </li>
+                    <li className="flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                      <span>Multimodal OCR for low-contrast scanned commission papers</span>
+                    </li>
+                    <li className="flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                      <span>Asynchronous background queue with safe idempotent retries</span>
+                    </li>
+                  </ul>
+                </div>
+              </div>
             </div>
-          </div>
+          )}
+
+          {/* TAB B: IMPORT FROM DIRECT URL */}
+          {ingestionMode === 'import_url' && (
+            <div className="max-w-3xl mx-auto bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 space-y-6 shadow-xs">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2 text-xs font-bold text-emerald-800 uppercase">
+                  <ShieldCheck className="w-4 h-4 text-emerald-600" />
+                  <span>SSRF-Protected URL Stream Engine</span>
+                </div>
+                <h2 className="text-lg font-bold text-slate-900">
+                  Import Public Past Paper or Lecture URL
+                </h2>
+                <p className="text-xs text-slate-500">
+                  Directly download and ingest public PDFs or media links. Built-in SSRF protection blocks private network ranges, loopbacks, and cloud metadata.
+                </p>
+              </div>
+
+              <form onSubmit={handleUrlImport} className="space-y-4">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-slate-700">Public Document or Video URL</label>
+                  <div className="relative">
+                    <input
+                      type="url"
+                      placeholder="https://example.com/papers/PPSC_General_Recruitment_2026.pdf"
+                      value={urlInput}
+                      onChange={(e) => setUrlInput(e.target.value)}
+                      required
+                      className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-900 font-mono focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                    />
+                  </div>
+                  <p className="text-[11px] text-slate-400">
+                    Must be a direct HTTP/HTTPS link to a PDF or video. Webpages with authentication or login walls are protected.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-semibold text-slate-700">Examining Commission</label>
+                    <select
+                      value={examiningBody}
+                      onChange={(e: any) => setExaminingBody(e.target.value)}
+                      className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-medium text-slate-800"
+                    >
+                      {examiningBodies.map((b) => (
+                        <option key={b.id} value={b.id}>
+                          {b.name} ({b.fullName})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-semibold text-slate-700">Exam Year</label>
+                    <select
+                      value={year}
+                      onChange={(e) => setYear(Number(e.target.value))}
+                      className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-medium text-slate-800"
+                    >
+                      {[2026, 2025, 2024, 2023, 2022, 2021].map((y) => (
+                        <option key={y} value={y}>
+                          {y}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {urlErrorMessage && (
+                  <div className="p-3 bg-red-50 text-red-700 text-xs rounded-lg border border-red-200 flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                    <div>{urlErrorMessage}</div>
+                  </div>
+                )}
+
+                {urlSuccessMessage && (
+                  <div className="p-3 bg-emerald-50 text-emerald-800 text-xs rounded-lg border border-emerald-200 flex items-start gap-2">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                    <div>{urlSuccessMessage}</div>
+                  </div>
+                )}
+
+                <button
+                  type="submit"
+                  disabled={urlIsImporting || !urlInput.trim()}
+                  className="w-full py-3.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-xl text-sm font-semibold transition-colors flex items-center justify-center gap-2 shadow-xs"
+                >
+                  {urlIsImporting ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Validating & Streaming Remote Document...
+                    </>
+                  ) : (
+                    <>
+                      <Send className="w-4 h-4" />
+                      Safely Ingest Document from URL
+                    </>
+                  )}
+                </button>
+              </form>
+            </div>
+          )}
+
+          {/* TAB C: BACKGROUND JOBS & MONITORING */}
+          {ingestionMode === 'queue' && (
+            <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 space-y-6 shadow-xs">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-base font-bold text-slate-900">
+                    Background Ingestion Jobs Queue
+                  </h2>
+                  <p className="text-xs text-slate-500">
+                    Durable asynchronous background worker pipeline. Track OCR, audio transcription, and MCQ synthesis.
+                  </p>
+                </div>
+                <button
+                  onClick={() => refreshJobsFromServer()}
+                  className="px-3.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 self-start"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  Refresh Queue
+                </button>
+              </div>
+
+              {processingJobs.length === 0 ? (
+                <div className="p-12 text-center text-slate-400 text-xs">
+                  No active background jobs. Upload a past paper or paste a URL above.
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {processingJobs.map((job) => {
+                    const isVideo = job.jobType === 'video';
+                    const isDone = ['Verified', 'Needs Review', 'Published'].includes(job.status);
+                    const isProcessing = ['Queued', 'Uploading', 'Processing', 'Transcribing', 'Generating MCQs'].includes(job.status);
+                    const isFailed = job.status === 'Failed';
+
+                    return (
+                      <div
+                        key={job.id}
+                        className="p-4 sm:p-5 rounded-xl border border-slate-200 bg-slate-50/60 hover:bg-white transition-all space-y-3"
+                      >
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                          <div className="flex items-center gap-2.5">
+                            <div className="w-9 h-9 rounded-lg bg-white border border-slate-200 flex items-center justify-center text-slate-700 shadow-2xs">
+                              {isVideo ? (
+                                <Video className="w-4 h-4 text-indigo-600" />
+                              ) : (
+                                <FileText className="w-4 h-4 text-emerald-600" />
+                              )}
+                            </div>
+                            <div>
+                              <div className="flex items-center gap-2">
+                                <h3 className="text-xs sm:text-sm font-bold text-slate-900 line-clamp-1">
+                                  {job.fileName}
+                                </h3>
+                                <span className="text-[10px] font-mono px-2 py-0.5 bg-slate-200 rounded text-slate-700">
+                                  {formatSize(job.fileSizeBytes)}
+                                </span>
+                              </div>
+                              <p className="text-[11px] text-slate-500">
+                                {job.examiningBodyId} · {job.examName} ({job.year}) · {job.sourceType === 'url' ? 'Imported via URL' : 'Uploaded File'}
+                              </p>
+                            </div>
+                          </div>
+
+                          {/* Status Badge */}
+                          <div className="flex items-center gap-2">
+                            <span
+                              className={`px-2.5 py-1 rounded-md text-[11px] font-bold flex items-center gap-1 ${
+                                job.status === 'Verified' || job.status === 'Published'
+                                  ? 'bg-emerald-100 text-emerald-800'
+                                  : job.status === 'Needs Review'
+                                  ? 'bg-amber-100 text-amber-800'
+                                  : job.status === 'Failed'
+                                  ? 'bg-red-100 text-red-800'
+                                  : 'bg-blue-100 text-blue-800'
+                              }`}
+                            >
+                              {isProcessing && <Loader2 className="w-3 h-3 animate-spin" />}
+                              {job.status}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Progress Bar & Stage description */}
+                        {isProcessing && (
+                          <div className="space-y-1.5 pt-1">
+                            <div className="w-full bg-slate-200 rounded-full h-2 overflow-hidden">
+                              <div
+                                className="bg-emerald-600 h-2 transition-all duration-300"
+                                style={{ width: `${job.progressPercent || 25}%` }}
+                              />
+                            </div>
+                            <div className="flex items-center justify-between text-[11px] text-slate-600">
+                              <span className="font-medium">{job.currentStage || 'Processing...'}</span>
+                              <span className="font-mono font-bold">{job.progressPercent || 0}%</span>
+                            </div>
+                          </div>
+                        )}
+
+                        {job.errorMessage && (
+                          <div className="p-2.5 bg-red-50 text-red-700 rounded-lg text-xs border border-red-200 flex items-start gap-2">
+                            <AlertTriangle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
+                            <span>{job.errorMessage}</span>
+                          </div>
+                        )}
+
+                        {/* Action buttons */}
+                        <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-200/60">
+                          <div className="flex items-center gap-3 text-xs text-slate-500 font-mono">
+                            {job.extractedQuestionsCount > 0 && (
+                              <span>{job.extractedQuestionsCount} MCQs extracted</span>
+                            )}
+                            {job.videoMetadata?.durationSeconds ? (
+                              <span>{Math.round(job.videoMetadata.durationSeconds)}s lecture</span>
+                            ) : null}
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            {/* Review MCQs */}
+                            {job.extractedQuestions && job.extractedQuestions.length > 0 && (
+                              <button
+                                onClick={() => handleLoadJobIntoReview(job)}
+                                className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1 shadow-2xs"
+                              >
+                                <Eye className="w-3.5 h-3.5" />
+                                Review & Practice MCQs
+                              </button>
+                            )}
+
+                            {/* View Transcript (for videos) */}
+                            {isVideo && job.transcript && (
+                              <button
+                                onClick={() => setInspectingVideoJob(job)}
+                                className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1 shadow-2xs"
+                              >
+                                <Video className="w-3.5 h-3.5" />
+                                View Transcript & Notes
+                              </button>
+                            )}
+
+                            {/* Publish button */}
+                            {isDone && job.status !== 'Published' && (
+                              <button
+                                onClick={() => handlePublishJob(job.id)}
+                                className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1"
+                              >
+                                <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                Publish to Question Bank
+                              </button>
+                            )}
+
+                            {/* Retry button */}
+                            {isFailed && (
+                              <button
+                                onClick={() => handleRetryJob(job.id)}
+                                className="px-3 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-800 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1"
+                              >
+                                <RotateCcw className="w-3.5 h-3.5" />
+                                Retry Job
+                              </button>
+                            )}
+
+                            {/* Cancel button */}
+                            {isProcessing && (
+                              <button
+                                onClick={() => handleCancelJob(job.id)}
+                                className="px-3 py-1.5 bg-red-50 hover:bg-red-100 text-red-700 rounded-lg text-xs font-semibold transition-colors"
+                              >
+                                Cancel
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* TAB D: PRESETS */}
+          {ingestionMode === 'presets' && (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-4 shadow-xs">
+                <div className="w-10 h-10 rounded-xl bg-emerald-50 text-emerald-700 flex items-center justify-center font-bold font-mono text-sm">
+                  FPSC
+                </div>
+                <h3 className="text-sm font-bold text-slate-900">
+                  CSS Screening Test (MPT) 2025
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Digital past paper covering Indus Waters Treaty, UN Security Council charter, and English vocabulary.
+                </p>
+                <button
+                  onClick={() => loadPreset('digital_css')}
+                  className="w-full py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-semibold transition-colors"
+                >
+                  Load & Parse FPSC Paper
+                </button>
+              </div>
+
+              <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-4 shadow-xs">
+                <div className="w-10 h-10 rounded-xl bg-amber-50 text-amber-700 flex items-center justify-center font-bold font-mono text-sm">
+                  PPSC
+                </div>
+                <h3 className="text-sm font-bold text-slate-900">
+                  PPSC Tehsildar Scanned Paper (OCR)
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Scanned revenue exam with low-contrast print requiring manual key verification.
+                </p>
+                <button
+                  onClick={() => loadPreset('scanned_ppsc')}
+                  className="w-full py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-semibold transition-colors"
+                >
+                  Load Scanned PPSC OCR
+                </button>
+              </div>
+
+              <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-4 shadow-xs">
+                <div className="w-10 h-10 rounded-xl bg-indigo-50 text-indigo-700 flex items-center justify-center font-bold font-mono text-sm">
+                  NOTES
+                </div>
+                <h3 className="text-sm font-bold text-slate-900">
+                  Pakistan Studies & Constitutional Notes
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Automatic MCQ generation from raw textbook chapters and constitutional law notes.
+                </p>
+                <button
+                  onClick={() => loadPreset('textbook_notes')}
+                  className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold transition-colors"
+                >
+                  Generate MCQs from Notes
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
-      {/* STAGE 2: PROCESSING LIVE LOADER */}
+      {/* =================================================================== */}
+      {/* STAGE 2: PROCESSING LOADER                                         */}
+      {/* =================================================================== */}
       {currentStage === 'processing' && (
         <div className="max-w-2xl mx-auto bg-white rounded-2xl border border-slate-200 p-8 text-center space-y-6 shadow-md my-8">
           <div className="w-16 h-16 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center mx-auto">
@@ -1124,19 +1716,21 @@ The All-India Muslim League was originally founded on 30 December 1906 in Dhaka 
 
           <div className="space-y-2">
             <h2 className="text-xl font-bold text-slate-900">
-              Processing Past Paper Document...
+              Processing Document / Media Ingestion...
             </h2>
-            <p className="text-xs text-slate-500">
-              Executing multimodal OCR, question segmentation, and schema verification.
-            </p>
+            <p className="text-xs text-slate-500">{activeJobStatusMessage}</p>
           </div>
 
-          {/* Step Progress Tracker */}
           <div className="space-y-3 text-left pt-2">
-            {processingSteps.map((step, idx) => {
+            {[
+              'Validating storage integrity & checksum',
+              'Inspecting pages / media tracks via multimodal OCR',
+              'Segmenting question stems and distractor boundaries',
+              'Extracting Options A, B, C, D & authoritative answer keys',
+              'Validating against Pakistani civil service exam schema',
+            ].map((step, idx) => {
               const isPast = processingStep > idx;
               const isCurrent = processingStep === idx;
-
               return (
                 <div
                   key={step}
@@ -1165,24 +1759,26 @@ The All-India Muslim League was originally founded on 30 December 1906 in Dhaka 
         </div>
       )}
 
-      {/* STAGE 3: PRE-QUIZ REVIEW & ANSWER VERIFICATION WORKSPACE */}
+      {/* =================================================================== */}
+      {/* STAGE 3: PRE-QUIZ REVIEW & ANSWER VERIFICATION                     */}
+      {/* =================================================================== */}
       {currentStage === 'review' && (
         <div className="space-y-6">
           <div className="bg-white rounded-2xl border border-slate-200 p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-xs">
             <div className="space-y-1">
               <div className="flex items-center gap-2">
                 <span className="px-2.5 py-0.5 bg-emerald-100 text-emerald-800 text-xs font-bold rounded">
-                  Extraction Successful
+                  Extracted Successfully
                 </span>
                 <span className="text-xs text-slate-500 font-mono">
-                  {extractedQuestions.length} Questions Extracted
+                  {extractedQuestions.length} Questions Ingested
                 </span>
               </div>
               <h2 className="text-lg font-bold text-slate-900">
-                Pre-Quiz Question Review & Key Verification
+                Pre-Quiz Question Review & Answer Key Verification
               </h2>
               <p className="text-xs text-slate-500">
-                Inspect extracted questions and verify departmental answer keys before launching interactive solving.
+                Inspect extracted questions and confirm commission keys. Questions without verified keys are flagged as &apos;Needs Review&apos; and will not falsely report correctness.
               </p>
             </div>
 
@@ -1191,14 +1787,14 @@ The All-India Muslim League was originally founded on 30 December 1906 in Dhaka 
                 onClick={() => setCurrentStage('upload')}
                 className="px-4 py-2 border border-slate-200 text-slate-700 hover:bg-slate-50 rounded-lg text-xs font-semibold transition-colors"
               >
-                Upload Another PDF
+                Back to Ingestion Hub
               </button>
               <button
                 onClick={handleStartQuiz}
                 className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-2 shadow-xs"
               >
                 <Play className="w-4 h-4 fill-current" />
-                Launch Interactive Quiz
+                Launch Interactive Practice Quiz
               </button>
             </div>
           </div>
@@ -1216,10 +1812,10 @@ The All-India Muslim League was originally founded on 30 December 1906 in Dhaka 
                     <span aria-hidden="true">·</span>
                     <span>{q.subject}</span>
                     <span aria-hidden="true">·</span>
-                    <span className="font-mono">Page {q.sourcePage}</span>
+                    <span className="font-mono">Page {q.sourcePage || 1}</span>
                     <span aria-hidden="true">·</span>
                     <span className="font-mono text-emerald-700 font-semibold">
-                      {Math.round((q.extractionConfidence || 0.9) * 100)}% Confidence
+                      {Math.round((q.extractionConfidence || 0.95) * 100)}% Confidence
                     </span>
                   </div>
 
@@ -1256,502 +1852,247 @@ The All-India Muslim League was originally founded on 30 December 1906 in Dhaka 
                   </div>
                 </div>
 
-                <div
-                  dir={q.language === 'Urdu' ? 'rtl' : 'ltr'}
-                  className={`text-sm font-semibold text-slate-900 ${
-                    q.language === 'Urdu' ? 'font-urdu text-base' : ''
+                <p
+                  className={`text-sm text-slate-900 font-medium ${
+                    q.language === 'Urdu' ? 'font-urdu text-right text-base' : ''
                   }`}
+                  dir={q.language === 'Urdu' ? 'rtl' : 'ltr'}
                 >
                   {q.questionText}
-                </div>
+                </p>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs pt-1">
+                {/* Options grid */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                   {q.options.map((opt) => (
                     <div
                       key={opt.id}
-                      className={`p-2.5 rounded-lg border flex items-center gap-2 ${
-                        q.correctOptionLabel === opt.label
-                          ? 'bg-emerald-50/70 border-emerald-300 font-semibold text-emerald-950'
+                      className={`p-3 rounded-lg border text-xs flex items-center gap-2 transition-colors ${
+                        opt.label === q.correctOptionLabel
+                          ? 'bg-emerald-50/70 border-emerald-400 text-emerald-950 font-semibold'
                           : 'bg-slate-50 border-slate-200 text-slate-700'
                       }`}
                     >
-                      <span className="w-5 h-5 rounded-full bg-white border flex items-center justify-center font-mono font-bold text-[10px]">
+                      <span className="w-5 h-5 rounded-md bg-white border border-slate-200 flex items-center justify-center font-mono font-bold text-[11px] shrink-0 text-slate-800">
                         {opt.label}
                       </span>
-                      <span>{opt.text}</span>
+                      <span
+                        className={`truncate ${
+                          q.language === 'Urdu' ? 'font-urdu text-sm' : ''
+                        }`}
+                      >
+                        {opt.text}
+                      </span>
                     </div>
                   ))}
                 </div>
+
+                {q.explanation && (
+                  <div className="p-3 bg-slate-50 rounded-lg text-xs text-slate-600 leading-relaxed border-t border-slate-100">
+                    <span className="font-semibold text-slate-800">Explanation: </span>
+                    {q.explanation}
+                  </div>
+                )}
               </div>
             ))}
           </div>
         </div>
       )}
 
-      {/* STAGE 4: INTERACTIVE MCQ QUIZ SOLVER */}
-      {currentStage === 'quiz' && (
-        <div className="space-y-6">
-          <div className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
-            <div className="flex items-center gap-3">
-              <button
-                onClick={() => setCurrentStage('review')}
-                className="text-xs font-semibold text-slate-600 hover:text-slate-900 flex items-center gap-1 shrink-0"
-              >
-                ← Back to Review
-              </button>
-              <div className="h-4 w-px bg-slate-200 hidden sm:block" />
-              <div className="text-xs text-slate-500 font-mono truncate">
-                Solving: <strong className="text-slate-800">{examName}</strong> ({year})
-              </div>
+      {/* =================================================================== */}
+      {/* STAGE 4: INTERACTIVE QUIZ                                          */}
+      {/* =================================================================== */}
+      {currentStage === 'quiz' && extractedQuestions[quizQuestionIndex] && (
+        <div className="max-w-4xl mx-auto space-y-6">
+          <div className="bg-white rounded-2xl border border-slate-200 p-6 flex items-center justify-between shadow-xs">
+            <div className="space-y-1">
+              <span className="text-xs font-bold text-emerald-700 uppercase tracking-wide">
+                Interactive Solving Mode
+              </span>
+              <h2 className="text-lg font-bold text-slate-900">
+                Question {quizQuestionIndex + 1} of {extractedQuestions.length}
+              </h2>
             </div>
 
-            <div className="flex items-center gap-3 justify-between sm:justify-end">
-              <span className="text-xs font-mono font-medium text-slate-600">
-                {Object.keys(quizAnswers).length} of {extractedQuestions.length} Answered
-              </span>
+            <div className="flex items-center gap-4">
+              <div className="text-right">
+                <div className="text-xs text-slate-400">Answered</div>
+                <div className="text-sm font-mono font-bold text-slate-900">
+                  {answeredCount} / {extractedQuestions.length}
+                </div>
+              </div>
               <button
                 onClick={() => setCurrentStage('results')}
-                disabled={Object.keys(quizAnswers).length === 0}
-                className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 disabled:hover:bg-emerald-600 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 shadow-2xs"
+                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-semibold transition-colors"
               >
-                <Trophy className="w-3.5 h-3.5" />
-                <span>Finish & View Results</span>
+                Submit Paper
               </button>
             </div>
           </div>
 
-          {/* Quick Progress Bar */}
-          <div className="w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
-            <div
-              className="bg-emerald-600 h-1.5 rounded-full transition-all duration-300"
-              style={{
-                width: `${Math.round(((quizQuestionIndex + 1) / Math.max(1, extractedQuestions.length)) * 100)}%`,
-              }}
-            />
-          </div>
+          {/* Interactive MCQ Card */}
+          <InteractiveMcqCard
+            question={extractedQuestions[quizQuestionIndex]}
+            questionIndex={quizQuestionIndex}
+            totalQuestions={extractedQuestions.length}
+            initialSelectedOption={quizAnswers[extractedQuestions[quizQuestionIndex].id]}
+            onAnswerSubmit={handleAnswerSelect}
+            isBookmarked={!!bookmarks[extractedQuestions[quizQuestionIndex].id]}
+            onBookmarkToggle={() => toggleBookmark(extractedQuestions[quizQuestionIndex].id)}
+            instantFeedback={true}
+            hasPrevious={quizQuestionIndex > 0}
+            hasNext={quizQuestionIndex < extractedQuestions.length - 1}
+            onPrevious={() => setQuizQuestionIndex((prev) => Math.max(0, prev - 1))}
+            onNext={() => setQuizQuestionIndex((prev) => Math.min(extractedQuestions.length - 1, prev + 1))}
+            onFinish={() => setCurrentStage('results')}
+          />
 
-          {extractedQuestions[quizQuestionIndex] && (
-            <InteractiveMcqCard
-              question={extractedQuestions[quizQuestionIndex]}
-              questionIndex={quizQuestionIndex}
-              totalQuestions={extractedQuestions.length}
-              initialSelectedOption={quizAnswers[extractedQuestions[quizQuestionIndex].id]}
-              onAnswerSubmit={handleQuizAnswer}
-              onBookmarkToggle={() =>
-                toggleBookmark(extractedQuestions[quizQuestionIndex].id)
-              }
-              isBookmarked={Boolean(
-                bookmarks[extractedQuestions[quizQuestionIndex].id]
-              )}
-              onPrevious={() => setQuizQuestionIndex(Math.max(0, quizQuestionIndex - 1))}
-              onNext={() =>
-                setQuizQuestionIndex(
-                  Math.min(extractedQuestions.length - 1, quizQuestionIndex + 1)
-                )
-              }
-              hasPrevious={quizQuestionIndex > 0}
-              hasNext={quizQuestionIndex < extractedQuestions.length - 1}
-              onVerifyAnswerKey={(key) =>
-                handleVerifyQuestionKey(quizQuestionIndex, key)
-              }
-              onFinish={() => setCurrentStage('results')}
-              instantFeedback={true}
-            />
-          )}
-        </div>
-      )}
-
-      {/* STAGE 5: COMPREHENSIVE RESULTS & SCORE SUMMARY */}
-      {currentStage === 'results' && (
-        <div className="space-y-6">
-          {/* Header Banner */}
-          <div className="bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 space-y-5 shadow-xs">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <div className="flex items-center gap-4">
-                <div className="w-14 h-14 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center border border-emerald-100 shadow-2xs">
-                  <Trophy className="w-7 h-7" />
-                </div>
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="px-2.5 py-0.5 bg-emerald-100 text-emerald-800 text-xs font-bold rounded">
-                      Quiz Completed
-                    </span>
-                    <span className="text-xs text-slate-500 font-mono">
-                      {examiningBody} · {year}
-                    </span>
-                  </div>
-                  <h2 className="text-xl sm:text-2xl font-extrabold text-slate-900 mt-1">
-                    Quiz Results & Performance Summary
-                  </h2>
-                  <p className="text-xs text-slate-500">
-                    Source: {selectedFile ? selectedFile.name : `${examName} Converted Exam`}
-                  </p>
-                </div>
-              </div>
-
-              {/* Performance Grade Badge */}
-              <div className="text-left sm:text-right sm:border-l sm:border-slate-100 sm:pl-6">
-                <div className="text-xs text-slate-400 uppercase tracking-wider font-semibold">
-                  Performance Rating
-                </div>
-                <div
-                  className={`text-base font-extrabold mt-0.5 ${
-                    quizResults.accuracy >= 75
-                      ? 'text-emerald-700'
-                      : quizResults.accuracy >= 50
-                      ? 'text-indigo-700'
-                      : 'text-amber-700'
-                  }`}
-                >
-                  {quizResults.accuracy >= 75
-                    ? 'Qualified (Distinction)'
-                    : quizResults.accuracy >= 50
-                    ? 'Passed (Qualified)'
-                    : 'Needs Revision'}
-                </div>
-                <div className="text-xs text-slate-500 font-mono mt-0.5">
-                  Accuracy: {quizResults.accuracy}%
-                </div>
-              </div>
+          {/* Question Navigator */}
+          <div className="bg-white rounded-2xl border border-slate-200 p-5 space-y-3 shadow-xs">
+            <div className="flex items-center justify-between text-xs text-slate-500">
+              <span className="font-semibold text-slate-700">Quick Question Jumper</span>
+              <span>{Math.round((answeredCount / extractedQuestions.length) * 100)}% Complete</span>
             </div>
 
-            {/* Direct Result Summary Sentence (as requested in user specification) */}
-            <div className="p-4 rounded-xl bg-emerald-50/70 border border-emerald-200 text-emerald-950 text-sm font-medium flex items-center gap-3">
-              <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
-              <span>
-                You answered{' '}
-                <strong className="font-bold text-emerald-900">
-                  {quizResults.correctCount} question{quizResults.correctCount === 1 ? '' : 's'} correctly
-                </strong>{' '}
-                and{' '}
-                <strong className="font-bold text-red-700">
-                  {quizResults.incorrectCount} question{quizResults.incorrectCount === 1 ? '' : 's'} incorrectly
-                </strong>{' '}
-                out of{' '}
-                <strong className="font-bold text-slate-900">
-                  {quizResults.totalQuestions} questions
-                </strong>.
-              </span>
-            </div>
-
-            {/* 4 KPI Metric Cards */}
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 pt-1">
-              <div className="p-4 rounded-xl border border-emerald-200 bg-emerald-50/40 space-y-1">
-                <div className="flex items-center justify-between text-emerald-700">
-                  <span className="text-xs font-bold uppercase tracking-wider">Correct</span>
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                </div>
-                <div className="text-2xl sm:text-3xl font-extrabold text-emerald-900 font-mono">
-                  {quizResults.correctCount}
-                </div>
-                <div className="text-[11px] text-emerald-700 font-medium">
-                  +{quizResults.correctCount}.00 marks earned
-                </div>
-              </div>
-
-              <div className="p-4 rounded-xl border border-red-200 bg-red-50/40 space-y-1">
-                <div className="flex items-center justify-between text-red-700">
-                  <span className="text-xs font-bold uppercase tracking-wider">Incorrect</span>
-                  <XCircle className="w-4 h-4 text-red-600" />
-                </div>
-                <div className="text-2xl sm:text-3xl font-extrabold text-red-900 font-mono">
-                  {quizResults.incorrectCount}
-                </div>
-                <div className="text-[11px] text-red-700 font-medium">
-                  {quizResults.totalPenalty > 0
-                    ? `-${quizResults.totalPenalty} penalty marks`
-                    : '0.00 penalty marks'}
-                </div>
-              </div>
-
-              <div className="p-4 rounded-xl border border-slate-200 bg-slate-50 space-y-1">
-                <div className="flex items-center justify-between text-slate-600">
-                  <span className="text-xs font-bold uppercase tracking-wider">Skipped</span>
-                  <AlertTriangle className="w-4 h-4 text-slate-400" />
-                </div>
-                <div className="text-2xl sm:text-3xl font-extrabold text-slate-800 font-mono">
-                  {quizResults.unattemptedCount}
-                </div>
-                <div className="text-[11px] text-slate-500 font-medium">
-                  Unanswered questions
-                </div>
-              </div>
-
-              <div className="p-4 rounded-xl border border-indigo-200 bg-indigo-50/40 space-y-1">
-                <div className="flex items-center justify-between text-indigo-700">
-                  <span className="text-xs font-bold uppercase tracking-wider">Net Score</span>
-                  <BarChart3 className="w-4 h-4 text-indigo-600" />
-                </div>
-                <div className="text-2xl sm:text-3xl font-extrabold text-indigo-950 font-mono">
-                  {quizResults.netScore}{' '}
-                  <span className="text-sm font-normal text-slate-500">
-                    / {quizResults.totalQuestions}
-                  </span>
-                </div>
-                <div className="text-[11px] text-indigo-700 font-medium">
-                  {negativeMarkingEnabled && quizResults.penaltyRate > 0
-                    ? `${examiningBody} (-${quizResults.penaltyRate}) rule applied`
-                    : 'Standard 1 mark per question'}
-                </div>
-              </div>
-            </div>
-
-            {/* Negative Marking Rule Toggle */}
-            {quizResults.penaltyRate > 0 && (
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-2 border-t border-slate-100 text-xs text-slate-600">
-                <span className="flex items-center gap-1.5">
-                  <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
-                  <span>
-                    {examiningBody} Official Scheme: -{quizResults.penaltyRate} marks deducted per incorrect answer.
-                  </span>
-                </span>
-                <label className="flex items-center gap-2 cursor-pointer font-medium text-slate-700">
-                  <input
-                    type="checkbox"
-                    checked={negativeMarkingEnabled}
-                    onChange={(e) => setNegativeMarkingEnabled(e.target.checked)}
-                    className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
-                  />
-                  <span>Apply Negative Marking</span>
-                </label>
-              </div>
-            )}
-          </div>
-
-          {/* Quick Action Navigation Buttons */}
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                onClick={() => {
-                  setQuizAnswers({});
-                  setQuizQuestionIndex(0);
-                  setCurrentStage('quiz');
-                }}
-                className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-semibold transition-colors flex items-center gap-2 shadow-xs"
-              >
-                <RotateCcw className="w-4 h-4" />
-                <span>Retake Converted Quiz</span>
-              </button>
-
-              {quizResults.incorrectCount > 0 && (
-                <button
-                  onClick={() => setResultsFilter('incorrect')}
-                  className="px-4 py-2.5 bg-red-50 hover:bg-red-100 text-red-800 border border-red-200 rounded-xl text-xs font-semibold transition-colors flex items-center gap-2"
-                >
-                  <XCircle className="w-4 h-4 text-red-600" />
-                  <span>Review {quizResults.incorrectCount} Mistakes</span>
-                </button>
-              )}
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                onClick={() => setCurrentStage('review')}
-                className="px-4 py-2.5 border border-slate-200 text-slate-700 hover:bg-slate-50 rounded-xl text-xs font-semibold transition-colors"
-              >
-                Inspect Questions & Keys
-              </button>
-              <button
-                onClick={() => setCurrentStage('upload')}
-                className="px-4 py-2.5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-semibold transition-colors flex items-center gap-2"
-              >
-                <UploadCloud className="w-4 h-4" />
-                <span>Upload Another PDF</span>
-              </button>
-            </div>
-          </div>
-
-          {/* Filterable Detailed Question Breakdown */}
-          <div className="space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2 border-b border-slate-200">
-              <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                <FileCheck className="w-4 h-4 text-slate-700" />
-                <span>Question-by-Question Detailed Review</span>
-              </h3>
-
-              {/* Filter Tabs */}
-              <div className="flex flex-wrap items-center gap-1.5 text-xs">
-                <button
-                  onClick={() => setResultsFilter('all')}
-                  className={`px-3 py-1.5 rounded-lg font-semibold transition-colors ${
-                    resultsFilter === 'all'
-                      ? 'bg-slate-900 text-white'
-                      : 'bg-slate-100 hover:bg-slate-200 text-slate-700'
-                  }`}
-                >
-                  All ({quizResults.totalQuestions})
-                </button>
-                <button
-                  onClick={() => setResultsFilter('correct')}
-                  className={`px-3 py-1.5 rounded-lg font-semibold transition-colors ${
-                    resultsFilter === 'correct'
-                      ? 'bg-emerald-700 text-white'
-                      : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-800'
-                  }`}
-                >
-                  Correct ({quizResults.correctCount})
-                </button>
-                <button
-                  onClick={() => setResultsFilter('incorrect')}
-                  className={`px-3 py-1.5 rounded-lg font-semibold transition-colors ${
-                    resultsFilter === 'incorrect'
-                      ? 'bg-red-700 text-white'
-                      : 'bg-red-50 hover:bg-red-100 text-red-800'
-                  }`}
-                >
-                  Incorrect ({quizResults.incorrectCount})
-                </button>
-                <button
-                  onClick={() => setResultsFilter('bookmarked')}
-                  className={`px-3 py-1.5 rounded-lg font-semibold transition-colors ${
-                    resultsFilter === 'bookmarked'
-                      ? 'bg-amber-700 text-white'
-                      : 'bg-amber-50 hover:bg-amber-100 text-amber-800'
-                  }`}
-                >
-                  Bookmarked ({extractedQuestions.filter((q) => bookmarks[q.id]).length})
-                </button>
-              </div>
-            </div>
-
-            {/* Questions list */}
-            <div className="space-y-4">
-              {filteredReviewQuestions.map((q) => {
-                const userAnswer = quizAnswers[q.id];
-                const isUserCorrect =
-                  userAnswer && q.correctOptionLabel && userAnswer === q.correctOptionLabel;
-                const isUserWrong =
-                  userAnswer && q.correctOptionLabel && userAnswer !== q.correctOptionLabel;
-
+            <div className="flex flex-wrap gap-2">
+              {extractedQuestions.map((q, idx) => {
+                const isCurrent = idx === quizQuestionIndex;
+                const isAns = Boolean(quizAnswers[q.id]);
                 return (
-                  <div
+                  <button
                     key={q.id}
-                    className={`bg-white rounded-2xl border p-6 space-y-4 shadow-xs transition-colors ${
-                      isUserCorrect
-                        ? 'border-emerald-200'
-                        : isUserWrong
-                        ? 'border-red-200'
-                        : 'border-slate-200'
+                    onClick={() => setQuizQuestionIndex(idx)}
+                    className={`w-8 h-8 rounded-lg font-mono text-xs font-bold transition-colors ${
+                      isCurrent
+                        ? 'bg-emerald-700 text-white ring-2 ring-emerald-500'
+                        : isAns
+                        ? 'bg-emerald-100 text-emerald-900 border border-emerald-300'
+                        : 'bg-slate-100 hover:bg-slate-200 text-slate-700'
                     }`}
                   >
-                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                      <div className="flex items-center gap-2">
-                        <span className="font-mono font-bold text-slate-900">
-                          Q#{q.questionNumber}
-                        </span>
-                        <span className="text-slate-300">·</span>
-                        <span className="text-slate-600 font-medium">{q.subject}</span>
-                        <span className="text-slate-300">·</span>
-                        <span className="font-mono text-slate-400">Page {q.sourcePage}</span>
-                      </div>
-
-                      <div className="flex items-center gap-2">
-                        {isUserCorrect ? (
-                          <span className="px-2.5 py-1 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 text-xs font-semibold flex items-center gap-1">
-                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                            <span>Your Answer: Option {userAnswer} (Correct)</span>
-                          </span>
-                        ) : isUserWrong ? (
-                          <span className="px-2.5 py-1 rounded bg-red-50 text-red-800 border border-red-200 text-xs font-semibold flex items-center gap-1">
-                            <XCircle className="w-3.5 h-3.5 text-red-600" />
-                            <span>Your Answer: Option {userAnswer} (Incorrect)</span>
-                          </span>
-                        ) : (
-                          <span className="px-2.5 py-1 rounded bg-slate-100 text-slate-700 text-xs font-medium">
-                            Not Answered
-                          </span>
-                        )}
-
-                        <button
-                          onClick={() => toggleBookmark(q.id)}
-                          className={`p-1.5 rounded-lg border text-xs ${
-                            bookmarks[q.id]
-                              ? 'bg-amber-50 border-amber-200 text-amber-700'
-                              : 'border-slate-200 text-slate-400 hover:text-slate-600'
-                          }`}
-                          title={bookmarks[q.id] ? 'Remove Bookmark' : 'Bookmark this Question'}
-                        >
-                          <Bookmark className="w-3.5 h-3.5 fill-current" />
-                        </button>
-                      </div>
-                    </div>
-
-                    <div
-                      dir={q.language === 'Urdu' ? 'rtl' : 'ltr'}
-                      className={`text-base font-bold text-slate-900 leading-relaxed ${
-                        q.language === 'Urdu' ? 'font-urdu text-xl' : ''
-                      }`}
-                    >
-                      {q.questionText}
-                    </div>
-
-                    {/* 4 Options Grid */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
-                      {q.options.map((opt) => {
-                        const isCorrectOpt = q.correctOptionLabel === opt.label;
-                        const isSelectedWrong = isUserWrong && userAnswer === opt.label;
-
-                        let optClass = 'bg-slate-50 border-slate-200 text-slate-700';
-                        if (isCorrectOpt) {
-                          optClass =
-                            'bg-emerald-50/80 border-emerald-400 text-emerald-950 font-semibold ring-1 ring-emerald-400';
-                        } else if (isSelectedWrong) {
-                          optClass =
-                            'bg-red-50/80 border-red-300 text-red-950 font-medium ring-1 ring-red-300';
-                        }
-
-                        return (
-                          <div
-                            key={opt.id}
-                            className={`p-3 rounded-xl border flex items-center justify-between gap-3 ${optClass}`}
-                          >
-                            <div className="flex items-center gap-2.5">
-                              <span
-                                className={`w-6 h-6 rounded-full border flex items-center justify-center font-mono font-bold text-[11px] shrink-0 ${
-                                  isCorrectOpt
-                                    ? 'bg-emerald-600 text-white border-emerald-600'
-                                    : isSelectedWrong
-                                    ? 'bg-red-600 text-white border-red-600'
-                                    : 'bg-white text-slate-700 border-slate-300'
-                                }`}
-                              >
-                                {opt.label}
-                              </span>
-                              <span
-                                dir={q.language === 'Urdu' ? 'rtl' : 'ltr'}
-                                className={q.language === 'Urdu' ? 'font-urdu text-sm' : ''}
-                              >
-                                {opt.text}
-                              </span>
-                            </div>
-
-                            {isCorrectOpt && (
-                              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                            )}
-                            {isSelectedWrong && (
-                              <XCircle className="w-4 h-4 text-red-600 shrink-0" />
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-
-                    {/* Explanation card */}
-                    {q.explanation && (
-                      <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200 text-xs text-slate-700 space-y-1">
-                        <div className="font-bold text-slate-900 flex items-center gap-1.5">
-                          <Sparkles className="w-3.5 h-3.5 text-emerald-600" />
-                          <span>Authoritative Explanation:</span>
-                        </div>
-                        <p className="leading-relaxed">{q.explanation}</p>
-                      </div>
-                    )}
-                  </div>
+                    {idx + 1}
+                  </button>
                 );
               })}
             </div>
+
+            <div className="flex items-center justify-between pt-2">
+              <button
+                onClick={() => setQuizQuestionIndex((prev) => Math.max(0, prev - 1))}
+                disabled={quizQuestionIndex === 0}
+                className="px-4 py-2 border border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-40 rounded-lg text-xs font-semibold"
+              >
+                Previous Question
+              </button>
+              <button
+                onClick={() =>
+                  setQuizQuestionIndex((prev) =>
+                    Math.min(extractedQuestions.length - 1, prev + 1)
+                  )
+                }
+                disabled={quizQuestionIndex === extractedQuestions.length - 1}
+                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white rounded-lg text-xs font-semibold"
+              >
+                Next Question
+              </button>
+            </div>
           </div>
         </div>
+      )}
+
+      {/* =================================================================== */}
+      {/* STAGE 5: RESULTS SCORECARD                                         */}
+      {/* =================================================================== */}
+      {currentStage === 'results' && (
+        <div className="max-w-4xl mx-auto space-y-6">
+          <div className="bg-white rounded-2xl border border-slate-200 p-8 shadow-xs space-y-6 text-center">
+            <div className="w-16 h-16 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center mx-auto shadow-xs">
+              <Trophy className="w-8 h-8" />
+            </div>
+
+            <div className="space-y-1">
+              <h2 className="text-2xl font-black text-slate-900 tracking-tight">
+                Exam Performance Scorecard
+              </h2>
+              <p className="text-xs text-slate-500">
+                Evaluation calculated in accordance with Pakistani Commission rules ({examiningBody}).
+              </p>
+            </div>
+
+            {/* Score Grid */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-left pt-2">
+              <div className="p-4 bg-slate-50 rounded-xl border border-slate-200">
+                <div className="text-xs text-slate-500 font-medium">Net Score</div>
+                <div className="text-2xl font-black font-mono text-emerald-700 mt-1">
+                  {netScore} / {totalQuestionsCount}
+                </div>
+                <div className="text-[11px] text-slate-400 mt-0.5">
+                  Negative penalty: {penalty}
+                </div>
+              </div>
+
+              <div className="p-4 bg-slate-50 rounded-xl border border-slate-200">
+                <div className="text-xs text-slate-500 font-medium">Accuracy</div>
+                <div className="text-2xl font-black font-mono text-slate-900 mt-1">
+                  {accuracyPercentage}%
+                </div>
+                <div className="text-[11px] text-slate-400 mt-0.5">
+                  {correctCount} correct of {answeredCount}
+                </div>
+              </div>
+
+              <div className="p-4 bg-slate-50 rounded-xl border border-slate-200">
+                <div className="text-xs text-slate-500 font-medium">Wrong Answers</div>
+                <div className="text-2xl font-black font-mono text-red-600 mt-1">
+                  {incorrectCount}
+                </div>
+                <div className="text-[11px] text-slate-400 mt-0.5">Added to Mistakes Notebook</div>
+              </div>
+
+              <div className="p-4 bg-slate-50 rounded-xl border border-slate-200">
+                <div className="text-xs text-slate-500 font-medium">Skipped</div>
+                <div className="text-2xl font-black font-mono text-slate-600 mt-1">
+                  {unattemptedCount}
+                </div>
+                <div className="text-[11px] text-slate-400 mt-0.5">Unattempted items</div>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-center gap-3 pt-4">
+              <button
+                onClick={handleStartQuiz}
+                className="px-5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5"
+              >
+                <RotateCcw className="w-4 h-4" />
+                Retake Exam
+              </button>
+              <button
+                onClick={() => setCurrentStage('review')}
+                className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 shadow-xs"
+              >
+                <Eye className="w-4 h-4" />
+                Review All Questions
+              </button>
+              <button
+                onClick={() => setActiveTab('papers')}
+                className="px-5 py-2.5 border border-slate-200 text-slate-700 hover:bg-slate-50 rounded-lg text-xs font-semibold transition-colors"
+              >
+                Go to Past Papers Bank
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Video Transcript & Study Notes Modal */}
+      {inspectingVideoJob && (
+        <VideoTranscriptModal
+          job={inspectingVideoJob}
+          onClose={() => setInspectingVideoJob(null)}
+          onPracticeQuestions={(questions) => {
+            setExtractedQuestions(questions);
+            setCurrentStage('quiz');
+          }}
+        />
       )}
     </div>
   );

@@ -53,6 +53,8 @@ interface AppContextType {
   // Admin Actions
   addProcessingJob: (job: ProcessingJob) => void;
   updateProcessingJobStatus: (jobId: string, status: ProcessingJob['status']) => void;
+  publishJobQuestionsToPaper: (jobId: string) => void;
+  refreshJobsFromServer: () => Promise<void>;
   updateQuestion: (questionId: string, updates: Partial<Question>) => void;
   addNewPaperWithQuestions: (paper: Paper, questions: Question[]) => void;
   deleteQuestion: (questionId: string) => void;
@@ -189,6 +191,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY_TIMESTAMPS, JSON.stringify(activityTimestamps));
   }, [activityTimestamps]);
+
+  // Initial jobs sync from server & polling while any job is in active processing
+  useEffect(() => {
+    refreshJobsFromServer();
+    const interval = setInterval(() => {
+      const hasActiveJobs = processingJobs.some((j) =>
+        ['Queued', 'Uploading', 'Processing', 'Transcribing', 'Extracting', 'Generating MCQs'].includes(j.status)
+      );
+      if (hasActiveJobs) {
+        refreshJobsFromServer();
+      }
+    }, 2500);
+
+    return () => clearInterval(interval);
+  }, [processingJobs]);
 
   // Log activity timestamp
   const logActivity = () => {
@@ -364,6 +381,52 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     );
   };
 
+  const refreshJobsFromServer = async () => {
+    try {
+      const res = await fetch('/api/jobs');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.jobs) && data.jobs.length > 0) {
+          setProcessingJobs(data.jobs);
+        }
+      }
+    } catch (err) {
+      console.warn('Could not sync jobs from server:', err);
+    }
+  };
+
+  const publishJobQuestionsToPaper = (jobId: string) => {
+    const job = processingJobs.find((j) => j.id === jobId);
+    if (!job || !job.extractedQuestions || job.extractedQuestions.length === 0) return;
+
+    const paperId = `paper-${job.id}`;
+    const existingPaper = papers.find((p) => p.id === paperId);
+    if (existingPaper) {
+      // Already published
+      updateProcessingJobStatus(jobId, 'Published');
+      return;
+    }
+
+    const newPaper: Paper = {
+      id: paperId,
+      title: `${job.examiningBodyId} - ${job.examName} (${job.year})`,
+      paperNumber: job.paperNumber || 'Paper 01',
+      examiningBodyId: job.examiningBodyId,
+      examinationName: job.examName,
+      year: job.year,
+      examDate: `${job.year}-05-01`,
+      subjectOrCategory: job.jobType === 'video' ? 'Video Lecture Ingestion' : 'Ingested Examination Paper',
+      totalQuestions: job.extractedQuestions.length,
+      durationMinutes: Math.max(30, job.extractedQuestions.length * 2),
+      negativeMarking: job.examiningBodyId === 'PPSC' || job.examiningBodyId === 'SPSC' ? 0.25 : 0,
+      verificationStatus: job.status === 'Needs Review' ? 'Needs Review' : 'Verified',
+      sourcePdfName: job.fileName,
+    };
+
+    addNewPaperWithQuestions(newPaper, job.extractedQuestions);
+    updateProcessingJobStatus(jobId, 'Published');
+  };
+
   const updateQuestion = (questionId: string, updates: Partial<Question>) => {
     setQuestions((prev) =>
       prev.map((q) => (q.id === questionId ? { ...q, ...updates } : q))
@@ -412,6 +475,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         resolveMistake,
         addProcessingJob,
         updateProcessingJobStatus,
+        publishJobQuestionsToPaper,
+        refreshJobsFromServer,
         updateQuestion,
         addNewPaperWithQuestions,
         deleteQuestion,

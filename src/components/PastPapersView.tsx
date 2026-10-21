@@ -17,8 +17,35 @@ import {
   Layers,
   ArrowUpDown,
   BookOpen,
+  Tag,
+  X,
+  Check,
 } from 'lucide-react';
-import { Paper } from '../types';
+import { Paper, SubjectCategory } from '../types';
+
+const POPULAR_STUDY_TOPICS = [
+  '1973 Constitution',
+  'Objectives Resolution',
+  'Indus Waters Treaty',
+  'Land Revenue Act 1967',
+  'SI Units & Physics',
+  'Sulh Hudaybiyyah',
+  'Urdu Adab',
+  'Subcontinent 1947',
+  'Computer & Networking',
+];
+
+const SUBJECT_CATEGORIES: SubjectCategory[] = [
+  'Pakistan Affairs',
+  'Islamic Studies',
+  'General Knowledge',
+  'Everyday Science',
+  'Current Affairs',
+  'English',
+  'Urdu',
+  'Mathematics & Reasoning',
+  'Computer Science',
+];
 
 export const PastPapersView: React.FC = () => {
   const {
@@ -34,6 +61,8 @@ export const PastPapersView: React.FC = () => {
 
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedSort, setSelectedSort] = useState<'newest' | 'oldest' | 'body' | 'title'>('newest');
+  const [selectedCategoryFilter, setSelectedCategoryFilter] = useState<SubjectCategory | null>(null);
+  const [selectedTopicTag, setSelectedTopicTag] = useState<string | null>(null);
   const [activeExpandedPaperId, setActiveExpandedPaperId] = useState<string | null>(null);
 
   // Extract all distinct years dynamically from database papers
@@ -42,20 +71,52 @@ export const PastPapersView: React.FC = () => {
     return years.sort((a, b) => b - a);
   }, [papers]);
 
-  // Filter papers
+  // Filter papers with category, topic, year, commission, and deep question search
   const filteredPapers = useMemo(() => {
     return papers
       .filter((paper) => {
         if (selectedYearFilter && paper.year !== selectedYearFilter) return false;
         if (selectedBodyFilter && paper.examiningBodyId !== selectedBodyFilter) return false;
+
+        const paperQuestions = questions.filter((q) => q.paperId === paper.id);
+
+        // Category Filter
+        if (selectedCategoryFilter) {
+          const matchPaperSubject = paper.subjectOrCategory.toLowerCase().includes(selectedCategoryFilter.toLowerCase());
+          const matchQuestionSubject = paperQuestions.some((q) => q.subject === selectedCategoryFilter);
+          if (!matchPaperSubject && !matchQuestionSubject) return false;
+        }
+
+        // Selected Study Topic Tag
+        if (selectedTopicTag) {
+          const topicLower = selectedTopicTag.toLowerCase();
+          const matchPaper =
+            paper.title.toLowerCase().includes(topicLower) ||
+            paper.examinationName.toLowerCase().includes(topicLower) ||
+            paper.subjectOrCategory.toLowerCase().includes(topicLower);
+          const matchQuestion = paperQuestions.some(
+            (q) =>
+              q.questionText.toLowerCase().includes(topicLower) ||
+              (q.explanation && q.explanation.toLowerCase().includes(topicLower))
+          );
+          if (!matchPaper && !matchQuestion) return false;
+        }
+
+        // Text Search Query
         if (searchQuery.trim()) {
-          const q = searchQuery.toLowerCase();
+          const q = searchQuery.toLowerCase().trim();
           const matchTitle = paper.title.toLowerCase().includes(q);
           const matchExam = paper.examinationName.toLowerCase().includes(q);
           const matchBody = paper.examiningBodyId.toLowerCase().includes(q);
           const matchSubject = paper.subjectOrCategory.toLowerCase().includes(q);
-          if (!matchTitle && !matchExam && !matchBody && !matchSubject) return false;
+          const matchQuestion = paperQuestions.some(
+            (item) =>
+              item.questionText.toLowerCase().includes(q) ||
+              (item.explanation && item.explanation.toLowerCase().includes(q))
+          );
+          if (!matchTitle && !matchExam && !matchBody && !matchSubject && !matchQuestion) return false;
         }
+
         return true;
       })
       .sort((a, b) => {
@@ -64,7 +125,7 @@ export const PastPapersView: React.FC = () => {
         if (selectedSort === 'body') return a.examiningBodyId.localeCompare(b.examiningBodyId);
         return a.title.localeCompare(b.title);
       });
-  }, [papers, selectedYearFilter, selectedBodyFilter, searchQuery, selectedSort]);
+  }, [papers, questions, selectedYearFilter, selectedBodyFilter, selectedCategoryFilter, selectedTopicTag, searchQuery, selectedSort]);
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
@@ -169,24 +230,112 @@ export const PastPapersView: React.FC = () => {
             </button>
           ))}
         </div>
+
+        {/* Subject Category Filter Buttons */}
+        <div className="flex items-center gap-2 flex-wrap pt-2 border-t border-slate-100">
+          <span className="text-xs font-semibold text-slate-500 mr-1 flex items-center gap-1">
+            <BookOpen className="w-3.5 h-3.5" /> Category:
+          </span>
+          <button
+            onClick={() => setSelectedCategoryFilter(null)}
+            className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
+              selectedCategoryFilter === null
+                ? 'bg-slate-900 text-white'
+                : 'bg-slate-100 text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            All Categories
+          </button>
+          {SUBJECT_CATEGORIES.map((category) => (
+            <button
+              key={category}
+              onClick={() => setSelectedCategoryFilter(selectedCategoryFilter === category ? null : category)}
+              className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
+                selectedCategoryFilter === category
+                  ? 'bg-emerald-800 text-white font-semibold'
+                  : 'bg-slate-100 text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              {category}
+            </button>
+          ))}
+        </div>
+
+        {/* Specific Study Topics Quick Search */}
+        <div className="flex items-center gap-2 flex-wrap pt-2 border-t border-slate-100">
+          <span className="text-xs font-semibold text-slate-500 mr-1 flex items-center gap-1">
+            <Tag className="w-3.5 h-3.5 text-emerald-600" /> Study Topics:
+          </span>
+          {POPULAR_STUDY_TOPICS.map((topic) => {
+            const isSelected = selectedTopicTag === topic;
+            return (
+              <button
+                key={topic}
+                onClick={() => setSelectedTopicTag(isSelected ? null : topic)}
+                className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors flex items-center gap-1 ${
+                  isSelected
+                    ? 'bg-emerald-100 text-emerald-900 border border-emerald-300 font-semibold'
+                    : 'bg-emerald-50/60 text-emerald-700 hover:bg-emerald-100/70 border border-emerald-100'
+                }`}
+              >
+                {isSelected && <Check className="w-3 h-3 text-emerald-700" />}
+                {topic}
+              </button>
+            );
+          })}
+        </div>
       </div>
 
-      {/* Results Header */}
-      <div className="flex items-center justify-between text-xs text-slate-500">
-        <span>
-          Showing <strong className="text-slate-900 font-mono">{filteredPapers.length}</strong> of{' '}
-          <strong className="text-slate-900 font-mono">{papers.length}</strong> archived papers
-        </span>
-        {(selectedYearFilter || selectedBodyFilter || searchQuery) && (
+      {/* Results Header & Active Filters Bar */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-slate-500">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span>
+            Showing <strong className="text-slate-900 font-mono">{filteredPapers.length}</strong> of{' '}
+            <strong className="text-slate-900 font-mono">{papers.length}</strong> archived papers
+          </span>
+
+          {(selectedCategoryFilter || selectedTopicTag) && (
+            <div className="flex items-center gap-1.5 ml-2">
+              {selectedCategoryFilter && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-200 text-slate-800 font-medium">
+                  {selectedCategoryFilter}
+                  <button
+                    onClick={() => setSelectedCategoryFilter(null)}
+                    className="hover:text-red-600"
+                    aria-label="Remove category filter"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              )}
+              {selectedTopicTag && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 font-medium">
+                  Topic: {selectedTopicTag}
+                  <button
+                    onClick={() => setSelectedTopicTag(null)}
+                    className="hover:text-red-600"
+                    aria-label="Remove topic filter"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+
+        {(selectedYearFilter || selectedBodyFilter || selectedCategoryFilter || selectedTopicTag || searchQuery) && (
           <button
             onClick={() => {
               setSelectedYearFilter(null);
               setSelectedBodyFilter(null);
+              setSelectedCategoryFilter(null);
+              setSelectedTopicTag(null);
               setSearchQuery('');
             }}
-            className="text-emerald-700 hover:underline font-semibold"
+            className="text-emerald-700 hover:underline font-semibold flex items-center gap-1 self-start sm:self-auto"
           >
-            Reset all filters
+            <X className="w-3.5 h-3.5" /> Reset all filters
           </button>
         )}
       </div>

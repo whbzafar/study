@@ -130,8 +130,47 @@ export interface UserStats {
   subjectProficiency: Record<SubjectCategory, { attempted: number; correct: number }>;
 }
 
+export interface VideoTranscriptSegment {
+  id: string;
+  start: number;
+  end: number;
+  text: string;
+}
+
+export interface VideoStudyNotes {
+  title: string;
+  summary: string;
+  keyPoints: string[];
+  suggestedPracticeTopics: string[];
+}
+
+export interface VideoMetadata {
+  durationSeconds: number;
+  width?: number;
+  height?: number;
+  format?: string;
+  audioCodec?: string;
+  bitrate?: number;
+}
+
+export type ProcessingJobStatus =
+  | 'Queued'
+  | 'Uploading'
+  | 'Processing'
+  | 'Transcribing'
+  | 'Extracting'
+  | 'Generating MCQs'
+  | 'Needs Review'
+  | 'Verified'
+  | 'Published'
+  | 'Failed'
+  | 'Cancelled';
+
 export interface ProcessingJob {
   id: string;
+  jobType?: 'pdf' | 'video';
+  sourceType?: 'upload' | 'url';
+  sourceUrl?: string;
   fileName: string;
   fileSizeBytes: number;
   documentType?: 'digital' | 'scanned';
@@ -140,11 +179,15 @@ export interface ProcessingJob {
   year: number;
   paperNumber: string;
   language: 'English' | 'Urdu' | 'Bilingual';
-  status: 'Uploaded' | 'Queued' | 'Processing' | 'Needs Review' | 'Verified' | 'Published' | 'Failed';
-  totalPages: number;
+  status: ProcessingJobStatus;
+  progressPercent?: number;
+  currentStage?: string;
+  totalPages?: number;
   extractedQuestionsCount: number;
   confidenceScore: number;
   uploadedAt: number;
+  startedAt?: number;
+  completedAt?: number;
   reviewedBy?: string;
   extractedQuestions?: Question[];
   rawExtractedText?: string;
@@ -154,5 +197,76 @@ export interface ProcessingJob {
     unverifiedCount: number;
     missingOptionsCount: number;
   };
+  videoMetadata?: VideoMetadata;
+  transcript?: {
+    segments: VideoTranscriptSegment[];
+    fullText: string;
+  };
+  studyNotes?: VideoStudyNotes;
   errorMessage?: string;
+  retryCount?: number;
+  storagePath?: string;
 }
+
+export interface SystemLimitsResponse {
+  maxUploadSizeBytes: number;
+  maxUploadSizeFormatted: string;
+  chunkSizeBytes: number;
+  chunkSizeFormatted: string;
+  maxUrlDownloadSizeBytes: number;
+  maxUrlDownloadFormatted: string;
+  supportedPdfTypes: string[];
+  supportedVideoTypes: string[];
+  ffmpegAvailable: boolean;
+  workerConcurrency: number;
+  storageUsage: {
+    totalFiles: number;
+    totalSizeBytes: number;
+    availableDiskBytes?: number;
+  };
+}
+
+export interface UploadSessionInitResponse {
+  uploadId: string;
+  fileName: string;
+  fileSizeBytes: number;
+  chunkSizeBytes: number;
+  totalChunks: number;
+  expiresAt: number;
+}
+
+export interface ChunkUploadResponse {
+  success: boolean;
+  uploadId: string;
+  chunkIndex: number;
+  uploadedBytes: number;
+  totalBytes: number;
+  isComplete: boolean;
+  nextChunkIndex?: number;
+}
+
+export interface DocumentChapter {
+  id: string;
+  chapterNumber: number;
+  title: string;
+  pageRange?: string;
+  startPage?: number;
+  endPage?: number;
+  estimatedQuestionsCount: number;
+  subject: SubjectCategory;
+  summary: string;
+  keyTopics: string[];
+  extractedTextSnippet?: string;
+  isGenerated?: boolean;
+}
+
+export interface DocumentOutline {
+  documentTitle: string;
+  totalPages: number;
+  examiningBodyId: ExaminingBodyId;
+  examName: string;
+  year: number;
+  chapters: DocumentChapter[];
+}
+
+

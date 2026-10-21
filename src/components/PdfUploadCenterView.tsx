@@ -278,7 +278,7 @@ Q5. Ambiguous past paper scan question with disputed key:
                 {selectedFile ? selectedFile.name : 'Click or drag and drop past paper PDF'}
               </p>
               <p className="text-xs text-slate-500 mt-0.5">
-                Supports single or multi-page scanned PDF documents (up to 50MB)
+                Supports single or multi-page scanned PDF documents with unlimited-scale chunk streaming
               </p>
             </div>
           </div>

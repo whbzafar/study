@@ -314,14 +314,19 @@ export const AdminDashboardView: React.FC = () => {
       {filterTab === 'jobs' ? (
         <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-xs">
           <div className="p-4 border-b border-slate-100 flex items-center justify-between">
-            <h3 className="text-sm font-bold text-slate-900">PDF Ingestion Pipelines</h3>
+            <h3 className="text-sm font-bold text-slate-900">Past Paper & Video Ingestion Pipelines</h3>
             <span className="text-xs text-slate-500 font-mono">{processingJobs.length} jobs total</span>
           </div>
           <div className="divide-y divide-slate-100">
             {processingJobs.map((job) => (
               <div key={job.id} className="p-4 flex items-center justify-between gap-4 text-xs">
                 <div className="space-y-1 max-w-md">
-                  <div className="font-semibold text-slate-900 truncate">{job.fileName}</div>
+                  <div className="font-semibold text-slate-900 truncate flex items-center gap-2">
+                    <span className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-slate-100 text-slate-700 uppercase">
+                      {job.jobType === 'video' ? 'VIDEO' : 'PDF'}
+                    </span>
+                    <span>{job.fileName}</span>
+                  </div>
                   <div className="text-slate-500 text-[11px]">
                     {job.examiningBodyId} · {job.examName} · {job.year}
                   </div>

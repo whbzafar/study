@@ -8,6 +8,15 @@ import { GoogleGenAI, Type } from '@google/genai';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
+import crypto from 'crypto';
+import fs from 'fs/promises';
+
+import { SERVER_CONFIG, formatBytes } from './src/server/config';
+import { storageManager } from './src/server/storageManager';
+import { jobManager } from './src/server/jobManager';
+import { validateUrlForSsrf, safeDownloadUrl } from './src/server/ssrfValidator';
+import { isFfmpegAvailable } from './src/server/mediaProcessor';
+import { generateDocumentOutline, generateChapterMcqs } from './src/server/geminiPipeline';
 
 dotenv.config();
 
@@ -17,8 +26,13 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// Raw body parser for binary chunk streams
+app.use('/api/upload/chunk', express.raw({ type: 'application/octet-stream', limit: '32mb' }));
+
+// JSON and URL-encoded parsers (using scalable limits, not fixed 50MB restriction)
+const jsonLimit = `${Math.ceil(SERVER_CONFIG.UPLOAD_CHUNK_SIZE_BYTES / (1024 * 1024)) * 3}mb`;
+app.use(express.json({ limit: jsonLimit }));
+app.use(express.urlencoded({ extended: true, limit: jsonLimit }));
 
 // Server-side Gemini initialization
 const ai = new GoogleGenAI({
@@ -30,7 +44,10 @@ const ai = new GoogleGenAI({
   },
 });
 
-// Health check endpoint
+// ---------------------------------------------------------------------------
+// 1. Health & System Limits Endpoints
+// ---------------------------------------------------------------------------
+
 app.get('/api/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
@@ -39,7 +56,316 @@ app.get('/api/health', (_req: Request, res: Response) => {
   });
 });
 
-// Endpoint: AI PDF / Text Extraction & Question Parsing
+app.get('/api/system/limits', async (_req: Request, res: Response) => {
+  try {
+    const storageUsage = await storageManager.getStorageStats();
+    const ffmpegAvailable = await isFfmpegAvailable();
+
+    res.json({
+      maxUploadSizeBytes: SERVER_CONFIG.MAX_UPLOAD_SIZE_BYTES,
+      maxUploadSizeFormatted: formatBytes(SERVER_CONFIG.MAX_UPLOAD_SIZE_BYTES),
+      chunkSizeBytes: SERVER_CONFIG.UPLOAD_CHUNK_SIZE_BYTES,
+      chunkSizeFormatted: formatBytes(SERVER_CONFIG.UPLOAD_CHUNK_SIZE_BYTES),
+      maxUrlDownloadSizeBytes: SERVER_CONFIG.MAX_URL_DOWNLOAD_SIZE_BYTES,
+      maxUrlDownloadFormatted: formatBytes(SERVER_CONFIG.MAX_URL_DOWNLOAD_SIZE_BYTES),
+      supportedPdfTypes: SERVER_CONFIG.SUPPORTED_PDF_MIME_TYPES,
+      supportedVideoTypes: SERVER_CONFIG.SUPPORTED_VIDEO_MIME_TYPES,
+      ffmpegAvailable,
+      workerConcurrency: SERVER_CONFIG.MAX_CONCURRENT_WORKERS,
+      storageUsage,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to retrieve system limits', details: error.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 2. Chunked Resumable Upload Endpoints
+// ---------------------------------------------------------------------------
+
+// Step A: Initialize upload session
+app.post('/api/upload/init', async (req: Request, res: Response) => {
+  try {
+    const { fileName, fileSizeBytes, mimeType, examMetadata } = req.body;
+
+    if (!fileName || !fileSizeBytes) {
+      return res.status(400).json({ error: 'fileName and fileSizeBytes are required' });
+    }
+
+    const session = await storageManager.initSession({
+      fileName,
+      fileSizeBytes: parseInt(fileSizeBytes, 10),
+      mimeType: mimeType || 'application/octet-stream',
+      examMetadata,
+    });
+
+    res.json({
+      uploadId: session.uploadId,
+      fileName: session.fileName,
+      fileSizeBytes: session.fileSizeBytes,
+      chunkSizeBytes: session.chunkSizeBytes,
+      totalChunks: session.totalChunks,
+      expiresAt: session.expiresAt,
+    });
+  } catch (error: any) {
+    console.error('Error in /api/upload/init:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Step B: Upload chunk (supports binary stream via octet-stream OR base64 payload)
+app.put('/api/upload/chunk', async (req: Request, res: Response) => {
+  try {
+    const uploadId = (req.headers['x-upload-id'] as string) || (req.query.uploadId as string);
+    const chunkIndexStr = (req.headers['x-chunk-index'] as string) || (req.query.chunkIndex as string);
+
+    if (!uploadId || chunkIndexStr === undefined) {
+      return res.status(400).json({ error: 'Missing x-upload-id or x-chunk-index header/query' });
+    }
+
+    const chunkIndex = parseInt(chunkIndexStr, 10);
+    let chunkBuffer: Buffer;
+
+    if (Buffer.isBuffer(req.body)) {
+      chunkBuffer = req.body;
+    } else if (req.body?.chunkBase64) {
+      chunkBuffer = Buffer.from(req.body.chunkBase64, 'base64');
+    } else {
+      return res.status(400).json({ error: 'No chunk payload received' });
+    }
+
+    const result = await storageManager.saveChunk({
+      uploadId,
+      chunkIndex,
+      chunkBuffer,
+    });
+
+    res.json({
+      success: true,
+      uploadId: result.uploadId,
+      chunkIndex: result.chunkIndex,
+      uploadedBytes: result.uploadedBytes,
+      totalBytes: result.totalBytes,
+      isComplete: result.isComplete,
+      receivedChunksCount: result.receivedChunksCount,
+      totalChunks: result.totalChunks,
+    });
+  } catch (error: any) {
+    console.error('Error in /api/upload/chunk:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// JSON fallback endpoint for environments where headers are restricted
+app.post('/api/upload/chunk-json', async (req: Request, res: Response) => {
+  try {
+    const { uploadId, chunkIndex, chunkBase64 } = req.body;
+    if (!uploadId || chunkIndex === undefined || !chunkBase64) {
+      return res.status(400).json({ error: 'Missing uploadId, chunkIndex, or chunkBase64' });
+    }
+
+    const chunkBuffer = Buffer.from(chunkBase64, 'base64');
+    const result = await storageManager.saveChunk({
+      uploadId,
+      chunkIndex: parseInt(chunkIndex, 10),
+      chunkBuffer,
+    });
+
+    res.json({
+      success: true,
+      ...result,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Step C: Check upload status (enables resume without re-uploading completed chunks)
+app.get('/api/upload/status/:uploadId', async (req: Request, res: Response) => {
+  try {
+    const session = await storageManager.getSession(req.params.uploadId);
+    if (!session) {
+      return res.status(404).json({ error: 'Upload session not found or expired' });
+    }
+
+    res.json({
+      uploadId: session.uploadId,
+      fileName: session.fileName,
+      fileSizeBytes: session.fileSizeBytes,
+      chunkSizeBytes: session.chunkSizeBytes,
+      totalChunks: session.totalChunks,
+      receivedChunks: session.receivedChunks,
+      isComplete: session.receivedChunks.length >= session.totalChunks,
+      expiresAt: session.expiresAt,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Step D: Complete upload & enqueue background processing job
+app.post('/api/upload/complete', async (req: Request, res: Response) => {
+  try {
+    const { uploadId } = req.body;
+    if (!uploadId) {
+      return res.status(400).json({ error: 'uploadId is required' });
+    }
+
+    // Assemble file without loading entire file into memory
+    const fileInfo = await storageManager.completeUpload(uploadId);
+
+    // Create durable background job
+    const meta = fileInfo.examMetadata || {};
+    const isVideo =
+      fileInfo.mimeType.startsWith('video/') ||
+      /\.(mp4|webm|mov|mkv|avi)$/i.test(fileInfo.fileName);
+
+    const job = await jobManager.createJob({
+      fileName: fileInfo.fileName,
+      fileSizeBytes: fileInfo.fileSizeBytes,
+      jobType: isVideo ? 'video' : 'pdf',
+      sourceType: 'upload',
+      documentType: meta.documentType || 'digital',
+      examiningBodyId: meta.examiningBody || 'PPSC',
+      examName: meta.examName || 'Competitive Examination',
+      year: meta.year ? parseInt(meta.year, 10) : 2026,
+      paperNumber: meta.paperNumber || 'Paper 01',
+      language: meta.language || 'Bilingual',
+      storagePath: fileInfo.filePath,
+    });
+
+    res.json({
+      success: true,
+      fileInfo: {
+        fileId: fileInfo.fileId,
+        fileName: fileInfo.fileName,
+        fileSizeBytes: fileInfo.fileSizeBytes,
+        sha256: fileInfo.sha256,
+      },
+      job,
+    });
+  } catch (error: any) {
+    console.error('Error in /api/upload/complete:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 3. SSRF-Safe PDF & Media URL Ingestion
+// ---------------------------------------------------------------------------
+
+app.post('/api/ingestion/import-url', async (req: Request, res: Response) => {
+  try {
+    const { url, examMetadata } = req.body;
+
+    if (!url) {
+      return res.status(400).json({ error: 'url parameter is required' });
+    }
+
+    // Step 1: Pre-validate URL syntax and target IP against private/metadata subnets
+    const validation = await validateUrlForSsrf(url);
+    if (!validation.isValid) {
+      return res.status(400).json({
+        error: 'Security Policy Violation: SSRF Protection Blocked URL',
+        details: validation.errorMessage,
+      });
+    }
+
+    // Step 2: Stream download safely to authorized storage
+    const fileId = `url-${crypto.randomUUID()}`;
+    const tempDest = path.join(SERVER_CONFIG.TEMP_CHUNKS_DIR, `${fileId}.tmp`);
+
+    const downloadResult = await safeDownloadUrl(
+      url,
+      tempDest,
+      SERVER_CONFIG.MAX_URL_DOWNLOAD_SIZE_BYTES
+    );
+
+    // Move to permanent storage
+    const finalExt = downloadResult.isPdf ? '.pdf' : path.extname(downloadResult.fileName) || '.pdf';
+    const finalPath = path.join(SERVER_CONFIG.STORAGE_DIR, `${fileId}${finalExt}`);
+    await fs.rename(downloadResult.filePath, finalPath);
+
+    const isVideo =
+      downloadResult.mimeType.startsWith('video/') ||
+      /\.(mp4|webm|mov|mkv|avi)$/i.test(downloadResult.fileName);
+
+    const meta = examMetadata || {};
+    const job = await jobManager.createJob({
+      fileName: downloadResult.fileName,
+      fileSizeBytes: downloadResult.fileSizeBytes,
+      jobType: isVideo ? 'video' : 'pdf',
+      sourceType: 'url',
+      sourceUrl: url,
+      documentType: meta.documentType || 'digital',
+      examiningBodyId: meta.examiningBody || 'PPSC',
+      examName: meta.examName || 'Imported Past Paper',
+      year: meta.year ? parseInt(meta.year, 10) : 2026,
+      paperNumber: meta.paperNumber || 'Paper 01',
+      language: meta.language || 'Bilingual',
+      storagePath: finalPath,
+    });
+
+    res.json({
+      success: true,
+      downloadResult: {
+        fileName: downloadResult.fileName,
+        fileSizeBytes: downloadResult.fileSizeBytes,
+        mimeType: downloadResult.mimeType,
+      },
+      job,
+    });
+  } catch (error: any) {
+    console.error('Error in /api/ingestion/import-url:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 4. Background Job Management Endpoints
+// ---------------------------------------------------------------------------
+
+// List all jobs
+app.get('/api/jobs', (_req: Request, res: Response) => {
+  res.json({ jobs: jobManager.getAllJobs() });
+});
+
+// Get single job details
+app.get('/api/jobs/:jobId', (req: Request, res: Response) => {
+  const job = jobManager.getJob(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+  res.json({ job });
+});
+
+// Retry a failed job safely and idempotently
+app.post('/api/jobs/:jobId/retry', async (req: Request, res: Response) => {
+  try {
+    const job = await jobManager.retryJob(req.params.jobId);
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+    res.json({ success: true, job });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Cancel an active job
+app.post('/api/jobs/:jobId/cancel', async (req: Request, res: Response) => {
+  try {
+    const success = await jobManager.cancelJob(req.params.jobId);
+    res.json({ success });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 5. Existing AI Endpoints (Legacy compatibility & immediate previews)
+// ---------------------------------------------------------------------------
+
 app.post('/api/gemini/extract-pdf', async (req: Request, res: Response) => {
   try {
     const { pdfBase64, sampleText, examMetadata, documentType, conversionMode } = req.body;
@@ -131,11 +457,6 @@ Q4. What is the escape velocity of an object from Earth's gravitational field?
 (C) 15.6 km/s
 (D) 7.9 km/s
 [Official Key: B]
-
-Q5. Question digitized from low-contrast scanned page with unverified answer key:
-(A) Statutory provision
-(B) Executive order
-(C) Departmental circular
       `;
 
       contentsParts.push({
@@ -202,7 +523,6 @@ Q5. Question digitized from low-contrast scanned page with unverified answer key
   }
 });
 
-// Endpoint: AI Question Explanation
 app.post('/api/gemini/explain-question', async (req: Request, res: Response) => {
   try {
     const { questionText, options, correctOptionLabel, subject, language } = req.body;
@@ -242,7 +562,59 @@ Keep it concise, clear, and focused under 150 words.`;
   }
 });
 
-// Mount Vite middleware in development or serve static build in production
+// Rapid Chapter Outline Generation (Syllabus & Modules Extraction)
+app.post('/api/gemini/generate-outline', async (req: Request, res: Response) => {
+  try {
+    const { fileName, sampleText, pdfBase64, examMetadata } = req.body;
+    const outline = await generateDocumentOutline({
+      fileName,
+      sampleText,
+      pdfBase64,
+      examMetadata,
+    });
+    return res.json(outline);
+  } catch (error: any) {
+    console.error('Error in /api/gemini/generate-outline:', error);
+    return res.status(500).json({
+      error: 'Failed to generate document outline',
+      details: error.message,
+    });
+  }
+});
+
+// Targeted Chapter MCQs Generation on demand
+app.post('/api/gemini/generate-chapter-mcqs', async (req: Request, res: Response) => {
+  try {
+    const { chapterTitle, keyTopics, subject, count, difficulty, examMetadata, paperId } = req.body;
+
+    if (!chapterTitle) {
+      return res.status(400).json({ error: 'chapterTitle is required' });
+    }
+
+    const questions = await generateChapterMcqs({
+      chapterTitle,
+      keyTopics: Array.isArray(keyTopics) ? keyTopics : [],
+      subject: subject || 'General Knowledge',
+      count: count ? parseInt(count, 10) : 5,
+      difficulty: difficulty || 'Medium',
+      examMetadata,
+      paperId,
+    });
+
+    return res.json({ questions });
+  } catch (error: any) {
+    console.error('Error in /api/gemini/generate-chapter-mcqs:', error);
+    return res.status(500).json({
+      error: 'Failed to generate chapter MCQs',
+      details: error.message,
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 6. Vite middleware / Static Asset Server
+// ---------------------------------------------------------------------------
+
 async function startServer() {
   if (process.env.NODE_ENV === 'production') {
     app.use(express.static(path.join(__dirname, 'dist')));

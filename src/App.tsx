@@ -15,6 +15,7 @@ import { SubjectsView } from './components/SubjectsView';
 import { BookmarksView } from './components/BookmarksView';
 import { MistakesNotebookView } from './components/MistakesNotebookView';
 import { PdfConverterView } from './components/PdfConverterView';
+import { ProgressAnalyticsView } from './components/ProgressAnalyticsView';
 import { AdminDashboardView } from './components/AdminDashboardView';
 import { SettingsView } from './components/SettingsView';
 

@@ -140,7 +140,7 @@ export const Navbar: React.FC = () => {
                   : 'hover:text-slate-900 hover:bg-slate-50'
               }`}
             >
-              PDF to MCQ
+              Ingestion Hub
             </button>
             {userRole === 'admin' && (
               <button
@@ -269,7 +269,7 @@ export const Navbar: React.FC = () => {
               activeTab === 'upload' ? 'bg-slate-900 text-white' : 'text-slate-600 bg-slate-100'
             }`}
           >
-            PDF Upload
+            Ingest Files
           </button>
           {userRole === 'admin' && (
             <button
